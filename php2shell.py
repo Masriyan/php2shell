@@ -7,7 +7,7 @@
  GitHub   : https://github.com/masriyan/php2shell
  LinkedIn : https://www.linkedin.com/in/sudo3rs/
 
- Authorized use only. NOT FOR PUBLIC RELEASE.
+ Authorized use only. PUBLIC RELEASE.
  Run only against systems you own or have explicit written authorization to test.
 ================================================================================
 
