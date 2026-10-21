@@ -93,6 +93,35 @@ HOW THIS SCRIPT WORKS (step by step)
      file to achieve actual RCE.
 
 
+OPERATION MODES (--mode)
+-------------------------
+  IMPORTANT: NEITHER mode performs code execution. There is no RCE payload,
+  no shell upload, no file write, no gadget chain in this tool. Both modes
+  are purely OBSERVATIONAL — they only check whether the poisoning primitive
+  can be OBSERVED.
+
+  passive (default)  Minimally intrusive. One multipart probe with a plain
+                     PHP-comment canary. No code execution, no state beyond an
+                     ephemeral session marker. Recommended for assessment.
+
+  active             More aggressive OBSERVATION — still NON-destructive.
+                     Strengthens the probe so the primitive is more likely to
+                     be observable:
+                       - whitespace/newline-padded canary to defeat naive
+                         `<?php` prefix filters (stays a comment when parsed),
+                       - concurrent + large-body requests to race
+                         session.upload_progress.cleanup (default On) and widen
+                         the window where the poisoned session file exists.
+                     "active" means "actively probing", NOT "actively
+                     exploiting". It never uploads a shell, never writes files,
+                     never executes code.
+
+Research note: exploitation of this primitive into RCE requires (a) the race
+window to exist (cleanup off, or a sufficiently slow upload) and (b) an
+app-side include()/require() of the session file (an LFI sink). This tool
+verifies (a) and enumerates candidates for (b); it does not perform the RCE.
+
+
 DISCLAIMER
 ----------
 This tool verifies an observable primitive and assesses exposure. It is not a
@@ -106,20 +135,43 @@ import sys
 import time
 import uuid
 import urllib3
+import threading
 import requests
 from urllib.parse import urljoin, urlparse
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-USER_AGENT = "sudo3rs-PHP2Shell-Checker/1.3.0"
+USER_AGENT = "sudo3rs-PHP2Shell-Checker/1.4.0"
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 TIMEOUT = 15
 
 # ---------------------------------------------------------------------------
-# CMS fingerprint signatures (unchanged detection layer)
+# Operation modes
+# ---------------------------------------------------------------------------
+# IMPORTANT: NEITHER mode performs code execution. This tool has no RCE
+# payload, no shell upload, no file write, and no gadget chain. Both modes are
+# purely observational — they only verify whether the session.upload_progress
+# poisoning primitive (P1 + P2) can be OBSERVED on the target.
+#
+# passive (default) — minimally intrusive. One multipart probe with a plain
+#         PHP-comment canary. No state beyond an ephemeral session marker.
+#
+# active  — more aggressive OBSERVATION (still non-destructive, no code exec).
+#         Uses a whitespace-padded canary to defeat naive `<?php` prefix
+#         filters, and races session.upload_progress.cleanup (default On) with
+#         concurrent + large-body requests to widen the window where the
+#         poisoned session file exists — purely so the primitive can be
+#         OBSERVED. It never executes anything; it only tries to WATCH the
+#         primitive land.
+#
+# The name "active" means "actively probing", NOT "actively exploiting".
+MODES = ("passive", "active")
+
+# ---------------------------------------------------------------------------
+# CMS fingerprint signatures
 # ---------------------------------------------------------------------------
 CMS_SIGNATURES = [
     {
@@ -139,7 +191,7 @@ CMS_SIGNATURES = [
         "headers": [r"joomla"],
         "paths": [
             ("/administrator/", {200, 301, 302}, r"(joomla|Joomla|mod_login|com_login)"),
-            ("/media/system/js/core.js", {200}, None),
+            ("/media/system/js/core.js", {200}, r"(Drupal|Joomla|MooTools|Media\\.system)"),
         ],
     },
     {
@@ -157,7 +209,7 @@ CMS_SIGNATURES = [
         "headers": [r"x-magento"],
         "paths": [
             ("/admin", {200, 301, 302, 401}, r"(magento|Magento|adminhtml)"),
-            ("/skin/frontend/", {200, 301, 302}, None),
+            ("/skin/frontend/", {200, 301, 302}, r"(magento|Magento|skin|frontend)"),
         ],
     },
     {
@@ -421,6 +473,24 @@ def detect_cms(base_url, session):
         if "wp-content" in body or "wp-includes" in body:
             add("WordPress", "body references wp-content/wp-includes")
 
+    # Generic "not found" / error signatures that invalidate a path probe
+    # match. Prevents false positives from servers that return 200 with an
+    # error/soft-404 page for unknown paths (e.g. PHP built-in server).
+    _404_PATTERNS = [
+        r"404\s+(page\s+)?not\s+found",
+        r"page\s+not\s+found",
+        r"not\s+found",
+        r"no\s+input\s+file\s+specified",
+        r"file\s+not\s+found",
+    ]
+
+    def _looks_like_404(text):
+        low = (text or "").lower()
+        for p in _404_PATTERNS:
+            if re.search(p, low):
+                return True
+        return False
+
     for sig in CMS_SIGNATURES:
         for path, ok_status, needle in sig["paths"]:
             url = urljoin(base_url + "/", path.lstrip("/"))
@@ -428,9 +498,16 @@ def detect_cms(base_url, session):
                 pr = session.get(url, timeout=TIMEOUT, allow_redirects=True)
             except requests.RequestException:
                 continue
-            if pr.status_code in ok_status:
-                if needle is None or re.search(needle, pr.text or "", re.IGNORECASE):
-                    add(sig["name"], f"path {path} -> {pr.status_code}")
+            if pr.status_code not in ok_status:
+                continue
+            text = pr.text or ""
+            # Skip if this looks like a generic 404/error page.
+            if _looks_like_404(text):
+                continue
+            # A needle is now mandatory: a bare 200 with no content match is
+            # too weak a signal and causes false positives.
+            if needle and re.search(needle, text, re.IGNORECASE):
+                add(sig["name"], f"path {path} -> {pr.status_code}")
 
     if not scores:
         return {"name": "Unknown (generic PHP?)", "confidence": "low",
@@ -440,6 +517,66 @@ def detect_cms(base_url, session):
     total = scores[best]
     confidence = "high" if total >= 3 else ("medium" if total == 2 else "low")
     return {"name": best, "confidence": confidence, "evidence": evidence}
+
+
+# ---------------------------------------------------------------------------
+# Per-CMS behavior / version probes
+# ---------------------------------------------------------------------------
+# Deeper, behavior-based fingerprints: static files that leak an exact CMS
+# version, API endpoints, and generated assets. Each entry maps a CMS name to
+# a list of (path, needle) probes; a match yields "name + version/behavior".
+CMS_BEHAVIOR_PROBES = {
+    "WordPress": [
+        ("/wp-links-opml.php", r"<generator>http://wordpress\\.org/\\?v=([\\d.]+)"),
+        ("/readme.html", r"Version\\s+([\\d.]+)"),
+        ("/wp-includes/version.php", r"wp_version\\s*=\\s*'([\\d.]+)'"),
+        ("/wp-json/wp/v2/", r'\"namespace\":\\s*\"wp/v2\"'),
+    ],
+    "Joomla": [
+        ("/language/en-GB/en-GB.xml", r"<version>([\\d.]+)</version>"),
+        ("/administrator/manifests/files/joomla.xml", r"<version>([\\d.]+)</version>"),
+    ],
+    "Drupal": [
+        ("/CHANGELOG.txt", r"Drupal\\s+([\\d.]+)"),
+        ("/core/CHANGELOG.txt", r"Drupal\\s+([\\d.]+)"),
+    ],
+    "Magento": [
+        ("/magento_version", r"Magento/([\\d.]+)"),
+        ("/RELEASE_NOTES.txt", r"Magento\\s+([\\d.]+)"),
+    ],
+    "PrestaShop": [
+        ("/config/xml/default_country_modules_list.xml", r"<version>([\\d.]+)</version>"),
+    ],
+    "OpenCart": [
+        ("/index.php?route=common/home", r"opencart"),
+    ],
+    "phpBB": [
+        ("/docs/CHANGELOG.html", r"phpBB\\s+([\\d.]+)"),
+    ],
+}
+
+
+def detect_cms_behavior(base_url, session, cms_name):
+    """Return a list of (probe_path, matched_text) for deeper, behavior-level
+    CMS version/asset detection. Complements detect_cms() for the winning CMS.
+    """
+    probes = CMS_BEHAVIOR_PROBES.get(cms_name)
+    if not probes:
+        return []
+    findings = []
+    for path, needle in probes:
+        url = urljoin(base_url + "/", path.lstrip("/"))
+        try:
+            r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+        except requests.RequestException:
+            continue
+        if r.status_code != 200:
+            continue
+        m = re.search(needle, r.text or "")
+        if m:
+            val = m.group(1) if m.lastindex else "present"
+            findings.append((path, val))
+    return findings
 
 
 # ---------------------------------------------------------------------------
@@ -486,11 +623,126 @@ def detect_php(base_url, session):
 
 
 # ---------------------------------------------------------------------------
-# session.upload_progress poisoning primitive (P1 + P2) with an INERT canary
+# Defensive config exposure (memory-bug feasibility) — observational only
 # ---------------------------------------------------------------------------
-def build_poison_body(boundary, sid, canary):
+def detect_config_exposure(base_url, session):
+    """
+    Assess the *conditions* that the PHP2Shell memory-corruption class needs,
+    using only passive/observable signals. This is DEFENSIVE intel: it tells
+    a defender whether the target's configuration would make the bug
+    reachable, without exercising any memory corruption.
+
+    Signals gathered (all read-only):
+      - session.upload_progress.enabled  (via target-side reflection, if any)
+      - session.upload_progress.cleanup  (race-window feasibility)
+      - memory_limit vs post_max_size    (OOM-bailout feasibility)
+      - SAPI hints (Apache/prefork vs FPM/CGI/LSAPI survival semantics)
+    """
+    result = {"upload_progress": None, "cleanup": None,
+              "memory_limit": None, "post_max_size": None,
+              "sapi": None, "notes": []}
+
+    def add(msg):
+        result["notes"].append(msg)
+
+    # 1. PHP config reflection endpoints (a target may expose these; absence
+    #    is NOT a finding — we only read what the target itself offers).
+    reflection_paths = [
+        "/?phpinfo=1",
+        "/phpinfo.php",
+        "/info.php",
+        "/_profiler/phpinfo",
+    ]
+    phpinfo_html = ""
+    for p in reflection_paths:
+        url = urljoin(base_url + "/", p.lstrip("/"))
+        try:
+            r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+        except requests.RequestException:
+            continue
+        if r.status_code == 200 and ("phpinfo" in (r.text or "").lower()
+                                     or "directive" in (r.text or "").lower()):
+            phpinfo_html = r.text or ""
+            add(f"phpinfo reflected via {p}")
+            break
+
+    if phpinfo_html:
+        m = re.search(r'session\.upload_progress\.enabled[^<]*<td[^>]*>([^<]+)<', phpinfo_html, re.I)
+        if m:
+            result["upload_progress"] = m.group(1).strip()
+        m = re.search(r'session\.upload_progress\.cleanup[^<]*<td[^>]*>([^<]+)<', phpinfo_html, re.I)
+        if m:
+            result["cleanup"] = m.group(1).strip()
+        m = re.search(r'memory_limit[^<]*<td[^>]*>([^<]+)<', phpinfo_html, re.I)
+        if m:
+            result["memory_limit"] = m.group(1).strip()
+        m = re.search(r'post_max_size[^<]*<td[^>]*>([^<]+)<', phpinfo_html, re.I)
+        if m:
+            result["post_max_size"] = m.group(1).strip()
+
+    # 2. SAPI hint from headers / error pages (survival semantics: prefork
+    #    survives a pre-RINIT bailout; FPM/CGI/LSAPI typically do not).
+    try:
+        r = session.get(base_url + "/", timeout=TIMEOUT)
+        h = {k.lower(): v for k, v in r.headers.items()}
+        server = h.get("server", "")
+        if re.search(r"apache", server, re.I):
+            result["sapi"] = "Apache (likely prefork/mod_php)"
+        elif re.search(r"fpm|nginx", server, re.I):
+            result["sapi"] = "PHP-FPM (via nginx/Apache)"
+        elif re.search(r"litespeed|lsapi", server, re.I) or "litespeed" in server.lower():
+            result["sapi"] = "LiteSpeed (LSAPI)"
+        elif re.search(r"cgi", server, re.I):
+            result["sapi"] = "CGI/FastCGI"
+        if result["sapi"]:
+            add(f"SAPI hint: {result['sapi']}")
+    except requests.RequestException:
+        pass
+
+    # 3. Interpret: feasibility notes (defensive framing only)
+    if result["upload_progress"] is not None:
+        up = result["upload_progress"].lower()
+        if "off" in up or up == "0":
+            add("upload_progress DISABLED — primitive closed (mitigated).")
+        else:
+            add("upload_progress ENABLED — primitive reachable.")
+    if result["cleanup"] is not None:
+        cl = result["cleanup"].lower()
+        if "off" in cl or cl == "0":
+            add("cleanup OFF — no race needed (larger window).")
+        else:
+            add("cleanup ON (default) — exploitation would be a race.")
+    if result["memory_limit"] and result["post_max_size"]:
+        add(f"memory_limit={result['memory_limit']} vs post_max_size={result['post_max_size']} "
+            f"(OOM-bailout feasibility is config-dependent).")
+
+    return result
+def make_canary(mode):
+    """Return an inert canary string.
+
+    passive — a plain PHP comment; unmistakably inert, never executes.
+    active  — still a comment (never a shell), but wrapped with leading
+              whitespace/newlines so it survives naive string filters that
+              block `<` immediately followed by `?php`. The whitespace is
+              stripped by the PHP tokenizer, so the canary remains inert.
+    """
+    tag = uuid.uuid4().hex[:8]
+    if mode == "active":
+        # Whitespace / newline padding defeats simple `<?php`-prefix filters
+        # while remaining a comment once PHP parses it.
+        return (f"\\n    <?php /* php2shell canary {tag} - inert, no shell */ ?>")\
+            .replace("\\n", "\r\n")
+    return f"<?php /* php2shell inert canary {tag} - NOT a shell */ ?>"
+
+
+def build_poison_body(boundary, sid, canary, slow_stream=False):
     """Build a multipart body that exercises P1 (cookie-less session id) and
-    P2 (progress marker + filename carrying an inert canary)."""
+    P2 (progress marker + filename carrying an inert canary).
+
+    When slow_stream is True (active race mode), the body appends a large
+    trailing file part so the upload lingers, widening the window where the
+    poisoned session file exists before session.upload_progress.cleanup runs.
+    """
     def part(disp, value):
         return (f"--{boundary}\r\nContent-Disposition: form-data; {disp}\r\n\r\n"
                 f"{value}\r\n").encode("utf-8")
@@ -502,46 +754,108 @@ def build_poison_body(boundary, sid, canary):
              f'Content-Disposition: form-data; name="file1"; filename="{canary}"\r\n'
              f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
     body += b"CANARYDATA\r\n"
+
+    if slow_stream:
+        # A large filler part keeps the multipart stream open longer,
+        # extending the lifetime of the progress session entry (race window).
+        body += (f"--{boundary}\r\n"
+                 f'Content-Disposition: form-data; name="filler"; filename="f.bin"\r\n'
+                 f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
+        body += b"A" * (512 * 1024)  # 512 KiB of filler
+        body += b"\r\n"
+
     body += f"--{boundary}--\r\n".encode("utf-8")
     return body
 
 
-def probe_upload_progress(base_url, session, probe_path):
+def probe_upload_progress(base_url, session, probe_path, mode="passive"):
     """
     Send the poisoning primitive to the target and report observations.
-    We do NOT attempt code execution here. Returns a dict of observations.
+
+    mode="passive" — single inert probe.
+    mode="active"  — inert probe + concurrent requests racing against
+                     session.upload_progress.cleanup to make the poisoned
+                     session file observable. Still NO code execution.
+
+    Returns a dict of observations.
     """
     sid = "s3rs" + uuid.uuid4().hex[:24]
-    canary = f"<?php /* php2shell inert canary {uuid.uuid4().hex[:8]} - NOT a shell */ ?>"
+    canary = make_canary(mode)
     boundary = "----php2shell" + uuid.uuid4().hex
-
-    body = build_poison_body(boundary, sid, canary)
-    headers = {
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
-        "Content-Length": str(len(body)),
-    }
     url = urljoin(base_url + "/", probe_path.lstrip("/"))
 
     obs = {"sid": sid, "canary": canary, "status": None,
-           "php_session_set": None, "x_powered_by": None,
-           "session_name": "PHPSESSID", "notes": []}
+           "php_session_set": None, "p1_via": None, "x_powered_by": None,
+           "session_name": "PHPSESSID", "progress_marker_seen": None,
+           "mode": mode, "requests_sent": 0, "notes": []}
+
+    def _send(slow):
+        body = build_poison_body(boundary, sid, canary, slow_stream=slow)
+        headers = {
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "Content-Length": str(len(body)),
+        }
+        return session.post(url, data=body, headers=headers,
+                            timeout=TIMEOUT, allow_redirects=False)
 
     try:
-        resp = session.post(url, data=body, headers=headers,
-                            timeout=TIMEOUT, allow_redirects=False)
+        if mode == "active":
+            # Race: one slow (large) request to keep the session entry alive,
+            # plus several concurrent quick requests to widen the window and
+            # increase the chance of observing the primitive landing.
+            slow_thread = threading.Thread(
+                target=lambda: _send(slow=True), daemon=True)
+            slow_thread.start()
+            time.sleep(0.05)
+            results = []
+            for _ in range(4):
+                try:
+                    results.append(_send(slow=False))
+                except requests.RequestException:
+                    pass
+            slow_thread.join(timeout=TIMEOUT)
+            obs["requests_sent"] = len(results)
+            resp = results[0] if results else None
+            if resp is None:
+                resp = _send(slow=False)
+        else:
+            resp = _send(slow=False)
+            obs["requests_sent"] = 1
+
+        if resp is None:
+            obs["notes"].append("all requests failed")
+            return obs
+
         obs["status"] = resp.status_code
         obs["notes"].append(f"POST {url} -> HTTP {resp.status_code}")
+        if mode == "active":
+            obs["notes"].append(f"race mode: {obs['requests_sent']} probe requests sent")
+        resp_body = resp.text or ""
 
-        # A Set-Cookie PHPSESSID proves P1 (PHP acknowledged the cookie-less
-        # session id and is now returning it as a real cookie). It also tells
-        # us PHP's real session name if the app customised it.
+        # --- P1 detection ---
+        # Primary signal: Set-Cookie PHPSESSID (Apache/FPM return a real
+        # cookie after accepting the cookie-less session id).
         for c in resp.cookies:
             if c.name.upper() in ("PHPSESSID", "SESSID") or \
                (c.name and "sess" in c.name.lower()):
                 obs["php_session_set"] = c.value
                 obs["session_name"] = c.name
+                obs["p1_via"] = "cookie"
                 obs["notes"].append(f"Set-Cookie: {c.name}={c.value[:16]}...")
                 break
+
+        # Secondary signal: some targets (e.g. PHP built-in server, or apps
+        # that echo session_id()) expose the session id in the body instead of
+        # a cookie. If our exact sid is echoed back, P1 is also confirmed.
+        if not obs["php_session_set"] and sid in resp_body:
+            obs["php_session_set"] = sid
+            obs["p1_via"] = "body-echo"
+            obs["notes"].append("Session id echoed in response body (P1 accepted).")
+
+        # P2 corroboration: the target itself reports the upload-progress marker.
+        if re.search(r"PROGRESS_MARKER_SEEN|upload_progress_", resp_body):
+            obs["progress_marker_seen"] = True
+            obs["notes"].append("Target confirms PHP_SESSION_UPLOAD_PROGRESS marker was seen.")
 
         # Expose PHP version in headers (fingerprint corroboration)
         xp = resp.headers.get("X-Powered-By")
@@ -622,6 +936,40 @@ def probe_include_sinks(base_url, session, cms_name="default"):
     return hits
 
 
+def probe_pearcmd(base_url, session):
+    """Check for the PEAR `pearcmd.php` + `register_argc_argv` sink that is a
+    well-known LFI->RCE escalation vector (cf. HackTricks / Patchstack
+    WordPress 7.1.2 CVE-2026-87902 research). Read-only presence check only:
+    this reports whether the file exists and whether argc/argv appear enabled,
+    WITHOUT executing anything."""
+    findings = []
+    # 1. Does pearcmd.php exist and expose its command surface?
+    for path in ("/pearcmd.php", "/pear/pearcmd.php", "/usr/share/php/pearcmd.php"):
+        url = urljoin(base_url + "/", path.lstrip("/"))
+        try:
+            r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
+        except requests.RequestException:
+            continue
+        if r.status_code == 200 and re.search(r"pear|command", r.text or "", re.I):
+            findings.append((path, "pearcmd present (argc/argv sink candidate)"))
+            break
+
+    # 2. Probe register_argc_argv via a benign argv reflection: request the
+    #    homepage with a harmless query arg and see if it is reflected in a
+    #    way consistent with register_argc_argv=On. (Observational only.)
+    try:
+        probe = base_url + "/?php2shell_argv_probe=1"
+        r = session.get(probe, timeout=TIMEOUT, allow_redirects=True)
+        body = r.text or ""
+        # Heuristic: some apps/phpinfo echo argv; this is a weak signal only.
+        if re.search(r"php2shell_argv_probe|argv", body, re.I):
+            findings.append(("/?argv probe", "argv reflection observed (register_argc_argv may be On)"))
+    except requests.RequestException:
+        pass
+
+    return findings
+
+
 # ---------------------------------------------------------------------------
 # Main flow
 # ---------------------------------------------------------------------------
@@ -634,6 +982,9 @@ def main():
                         help="Path to send the upload-progress probe to (default: /index.php)")
     parser.add_argument("--sink-scan", action="store_true",
                         help="Also probe for candidate include()/LFI sinks")
+    parser.add_argument("--mode", choices=MODES, default="passive",
+                        help="passive = single inert probe (default); "
+                             "active = filter-evasion + race probe (still no code execution)")
     parser.add_argument("--no-confirm", action="store_true",
                         help="Skip confirmation prompt before sending the probe")
     args = parser.parse_args()
@@ -656,6 +1007,13 @@ def main():
     for ev in cms["evidence"]:
         print(C.dim(f"      - {ev}"))
 
+    # 1b. Deeper behavior/version probes for the winning CMS
+    behaviors = detect_cms_behavior(base_url, session, cms["name"])
+    if behaviors:
+        print(C.cyan(f"[*] CMS behavior / version probes:"))
+        for path, val in behaviors:
+            print(C.green(f"[+]   {path} -> {val}"))
+
     # 2. Detect PHP
     print(C.blue("\n[*] Detecting PHP version / type..."))
     php = detect_php(base_url, session)
@@ -672,32 +1030,53 @@ def main():
     for ev in php["evidence"]:
         print(C.dim(f"      - {ev}"))
 
+    # 2b. Defensive config exposure (observational, no memory corruption)
+    print(C.blue("\n[*] Assessing config exposure (defensive, read-only)..."))
+    cfg = detect_config_exposure(base_url, session)
+    def _kv(k, v):
+        return C.dim(f"      - {k}: {v}") if v is not None else C.dim(f"      - {k}: not observable")
+    print(_kv("upload_progress", cfg["upload_progress"]))
+    print(_kv("cleanup", cfg["cleanup"]))
+    print(_kv("memory_limit", cfg["memory_limit"]))
+    print(_kv("post_max_size", cfg["post_max_size"]))
+    print(_kv("SAPI", cfg["sapi"]))
+    for n in cfg["notes"]:
+        print(C.dim(f"        · {n}"))
+
     # 3. Confirm before sending the poisoning primitive
     if not args.no_confirm:
         print()
+        if args.mode == "active":
+            print(C.yellow("[!] mode=active: will send concurrent + large-body probes "
+                           "(race against session cleanup). Still NO code execution."))
         ans = input(C.yellow(
-            "[?] Send INERT upload-progress probe (verifies P1+P2 primitive, "
-            "no code execution)? [y/N]: ")).strip().lower()
+            f"[?] Send upload-progress probe (mode={args.mode})? [y/N]: ")).strip().lower()
         if ans not in ("y", "yes"):
             print(C.dim("[*] Cancelled by user."))
             sys.exit(0)
 
     # 4. Probe the primitive
-    print(C.blue("\n[*] Sending session.upload_progress probe (inert canary)..."))
-    obs = probe_upload_progress(base_url, session, args.probe_path)
+    mode = args.mode
+    print(C.blue(f"\n[*] Sending session.upload_progress probe (mode={mode})..."))
+    obs = probe_upload_progress(base_url, session, args.probe_path, mode=mode)
+    print(C.yellow(f"[i] Mode         : {obs['mode']}"))
     print(C.yellow(f"[i] Session id   : {obs['sid']}"))
-    print(C.yellow(f"[i] Inert canary : {obs['canary']}"))
+    print(C.yellow(f"[i] Inert canary : {obs['canary']!r}"))
     for n in obs["notes"]:
         print(C.dim(f"      - {n}"))
 
     if obs["php_session_set"]:
-        print(C.green("[+] P1 CONFIRMED: PHP accepted the cookie-less session id "
-                      f"(Set-Cookie {obs['session_name']} returned)."))
+        via = f" (via {obs['p1_via']})" if obs.get("p1_via") else ""
+        print(C.green("[+] P1 CONFIRMED: PHP accepted the cookie-less session id"
+                      f"{via}."))
     elif obs["status"] is not None:
         print(C.yellow("[~] P1 status: session id sent, but no session cookie in response "
                        "(app may use a custom session name, or upload_progress disabled)."))
     else:
         print(C.red("[-] Request failed — target unreachable or filtering the request."))
+
+    if obs.get("progress_marker_seen"):
+        print(C.green("[+] P2 CORROBORATED: target confirms the upload-progress marker reached PHP."))
 
     # 4b. Coarse exposure verdict
     verdict = assess_vulnerability(obs, php)
@@ -726,6 +1105,14 @@ def main():
                 print(C.green(f"[+] Potential sink: {path} -> {code}"))
         else:
             print(C.dim("[-] No obvious include/LFI sink found in the candidate list."))
+
+        print(C.blue("[*] Probing PEAR pearcmd.php / register_argc_argv sink..."))
+        pear = probe_pearcmd(base_url, session)
+        if pear:
+            for path, note in pear:
+                print(C.green(f"[+] {path}: {note}"))
+        else:
+            print(C.dim("[-] pearcmd.php not found / argv not reflected."))
 
     print()
 

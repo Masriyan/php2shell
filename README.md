@@ -74,10 +74,20 @@ For deeper background, see [`docs/RESEARCH.md`](docs/RESEARCH.md).
 - 🎯 **Interactive + CLI** target input (`--url`, or prompt)
 - 🧭 **11 CMS fingerprints** — WordPress, Joomla, Drupal, Magento, Laravel,
   CodeIgniter, Symfony, phpBB, PrestaShop, OpenCart, Typo3 (+ generic PHP)
+- 🧬 **Per-CMS behavior/version probes** — reads version-leaking static files
+  (`readme.html`, `wp-includes/version.php`, `CHANGELOG.txt`, …) for the winning CMS
 - 🐘 **PHP version / type / support-status** detection (active / security / EOL)
 - 🧪 **Inert** poisoning-primitive probe (P1 + P2, canary = PHP comment)
+- 🛡️ **Two observation modes** — `passive` (single inert probe, default) and
+  `active` (filter-evasion + race against `session.upload_progress.cleanup`).
+  **Neither performs code execution** — both are purely observational.
 - 📊 **Coarse exposure verdict** (Likely affected → Unreachable)
+- 🧱 **Defensive config exposure** — reads observable `session.upload_progress.enabled`,
+  `cleanup`, `memory_limit`/`post_max_size`, and SAPI hints (prefork vs FPM/LSAPI)
+  to assess *feasibility* of the memory-bug class — read-only, no corruption
 - 🔗 **Per-CMS** candidate `include()`/LFI sink scan (`--sink-scan`)
+- 🍐 **PEAR sink probe** — checks `pearcmd.php` presence + `register_argc_argv`
+  reflection (a known LFI→RCE escalation vector) — read-only
 
 ---
 
@@ -102,15 +112,34 @@ python3 php2shell.py --url https://example.com
 
 ```
 usage: php2shell.py [-h] [--url URL] [--probe-path PROBE_PATH]
-                    [--sink-scan] [--no-confirm]
+                    [--sink-scan] [--mode {passive,active}] [--no-confirm]
 
 options:
   -h, --help            show this help message and exit
   --url, -u URL         Target URL (e.g. https://example.com)
   --probe-path PATH     Path for the upload-progress probe (default: /index.php)
   --sink-scan           Also probe for candidate include()/LFI sinks
+  --mode {passive,active}
+                        passive = single inert probe (default);
+                        active = filter-evasion + race probe (still no code execution)
   --no-confirm          Skip confirmation prompt before sending the probe
 ```
+
+### Observation modes
+
+> **Neither mode performs code execution.** This tool has no RCE payload, no
+> shell upload, no file write, and no gadget chain. Both modes only *observe*
+> whether the `session.upload_progress` poisoning primitive lands.
+
+| Mode | Default | Behaviour |
+|------|---------|-----------|
+| `passive` | ✅ | One inert multipart probe. Canary is a plain PHP comment. Minimal footprint. |
+| `active` | | **Still observational, still non-destructive.** Whitespace-padded canary (defeats naive `<?php` prefix filters) + concurrent/large-body requests to race `session.upload_progress.cleanup`. *"active" = actively probing, NOT actively exploiting.* |
+
+> **Race note (from research):** PHP defaults `session.upload_progress.cleanup`
+> to `On`, so the progress entry is deleted as soon as the upload completes.
+> `active` tries to widen that window — but actual RCE additionally requires an
+> app-side `include()`/`require()` of the session file (an LFI sink).
 
 ### Examples
 
@@ -120,6 +149,9 @@ python3 php2shell.py --url https://example.com
 
 # Full run including sink scan, no interactive prompt
 python3 php2shell.py -u https://example.com --sink-scan --no-confirm
+
+# Active (filter-evasion + race) observation — still no code execution
+python3 php2shell.py -u https://example.com --mode active --no-confirm
 
 # Custom probe path (e.g. WordPress backend)
 python3 php2shell.py -u https://example.com --probe-path /wp-login.php

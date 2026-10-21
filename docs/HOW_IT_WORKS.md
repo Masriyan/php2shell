@@ -41,6 +41,24 @@ Recognized CMS: **WordPress, Joomla, Drupal, Magento, Laravel, CodeIgniter,
 Symfony, phpBB, PrestaShop, OpenCart, Typo3** — falling back to
 `Unknown (generic PHP?)`.
 
+### Anti-false-positive guards
+
+- **Needle is mandatory** — a bare HTTP `200` with no content match no longer
+  counts (prevents soft-404 servers from matching everything).
+- **404/error-page filter** — responses that look like `404 not found`,
+  `no input file specified`, etc. are discarded before matching.
+
+### Behavior / version probes (deep)
+
+After the winning CMS is chosen, `detect_cms_behavior()` reads version-leaking
+static files to pin the exact version:
+
+- WordPress → `readme.html`, `wp-includes/version.php`, `wp-links-opml.php`, `wp-json/wp/v2/`
+- Joomla → `language/en-GB/en-GB.xml`, `administrator/manifests/files/joomla.xml`
+- Drupal → `CHANGELOG.txt`, `core/CHANGELOG.txt`
+- Magento → `magento_version`, `RELEASE_NOTES.txt`
+- PrestaShop / OpenCart / phpBB → version files
+
 ---
 
 ## Phase 3 — PHP version / type / support status
@@ -121,6 +139,32 @@ With `--sink-scan`, the tool probes per-CMS candidate `include()`/LFI endpoints
 using read-only `/etc/passwd` checks (`root:x:0:0`). These are the endpoints an
 operator would need to **chain** with a poisoned session file to achieve actual
 RCE. None is a guaranteed sink.
+
+### PEAR sink probe
+
+`probe_pearcmd()` additionally checks for `pearcmd.php` (`/pearcmd.php`,
+`/pear/pearcmd.php`, `/usr/share/php/pearcmd.php`) and looks for
+`register_argc_argv` reflection. This is the well-documented PEAR LFI→RCE
+escalation vector (cf. Patchstack's WordPress 7.1.2 / CVE-2026-87902 research).
+Read-only presence check — nothing is executed.
+
+## Defensive config exposure (Phase 2b)
+
+**Function:** `detect_config_exposure()`
+
+Before the probe, the tool assesses the *conditions* the memory-corruption
+class needs, using only observable signals:
+
+| Signal | Why it matters |
+|--------|----------------|
+| `session.upload_progress.enabled` | If Off, the primitive is closed (mitigated). |
+| `session.upload_progress.cleanup` | If On (default), exploitation is a race. |
+| `memory_limit` vs `post_max_size` | Small `memory_limit` relative to a large `post_max_size` is the OOM-bailout precondition for the UAF class. |
+| SAPI hint | Apache/prefork child survives a pre-RINIT bailout; FPM/CGI/LSAPI typically exit. |
+
+These are read from `phpinfo`-style reflection endpoints if the target exposes
+one (absence is **not** a finding). This is **defensive intel only** — no
+memory corruption is exercised.
 
 ---
 
