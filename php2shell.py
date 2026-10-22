@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""
+"""PHP2Shell exposure checker — CVE-2026-109618 & CVE-2026-109619.
+
 ================================================================================
  PHP2Shell — CVE-2026-109618 / CVE-2026-109619 research & assessment tool
 ================================================================================
- Author   : sudo3rs (Mas Rian)
+ Author   : sudo3rs (Mas Riyan)
  GitHub   : https://github.com/masriyan/php2shell
  LinkedIn : https://www.linkedin.com/in/sudo3rs/
 
@@ -11,1115 +12,744 @@
  Run only against systems you own or have explicit written authorization to test.
 ================================================================================
 
+Detects whether a URL is likely exposed to the "PHP2Shell" PHP RCE pair
+(disclosed 2026-10-21) by fingerprinting the PHP version, the CMS/platform, and
+relevant config, then comparing against the vendor's fixed releases. Findings
+are correlated with live threat intel (CISA KEV + FIRST EPSS).
 
-WHAT THIS TOOL ACTUALLY DOES (AND DOES NOT DO)
-----------------------------------------------
-The PHP2Shell vulnerabilities are PHP-core bugs tied to the
-`session.upload_progress` feature. The confirmed, publicly-documented
-primitive is SESSION-FILE POISONING, not PHP object deserialization:
+This is a DETECTION tool for authorized testing, not an exploit. Both CVEs are
+internal memory-safety bugs (OOM-driven corruption / use-after-free); there is
+no safe boolean "trigger" probe, so this script determines exposure from the
+reported PHP version and mitigation signals — it never sends an exploit payload.
 
-  P1  Set a session ID cookie-lessly via a `PHPSESSID` field in the multipart body.
-  P2  Inject arbitrary content (e.g. `<?php ...`) into the session file via the
-      `PHP_SESSION_UPLOAD_PROGRESS` field value and the uploaded filename, which
-      PHP serializes verbatim into `sess_<id>`.
+Only run this against hosts you own or are explicitly authorized to test.
 
-The injected content only becomes CODE EXECUTION when the target application
-performs an `include()` / `require()` on the poisoned session file. Stock
-WordPress / Joomla / Drupal do NOT hand you that sink — turning this into RCE
-requires a separately vulnerable app/plugin (an LFI-to-include, a template
-include, etc.), which this tool does not provide.
+Two measurement modes:
+  safe (default)  passive: read PHP version + CMS from headers and the landing
+                  page HTML only.
+  --no-safe-mode  active recon: also query PHP's version-disclosure "egg" and a
+                  few well-known CMS fingerprint paths. Non-destructive.
 
-This tool therefore does three honest things:
-  1. Detect the CMS and PHP version/type of a target (fingerprinting).
-  2. Verify the poisoning PRIMITIVE (P1 + P2) against the target, using an
-     INERT canary (a PHP comment, never a shell), and report whether the
-     target is likely affected by the session.upload_progress bug.
-  3. Optionally probe for candidate include() sinks (LFI-style endpoints) that
-     an operator would need to chain for actual RCE.
-
-It does NOT ship a working RCE gadget chain, because none has been publicly
-confirmed as of the advisory window. The earlier "GenericClass / __destruct /
-system()" payload was fabricated and has been removed.
-
-
-HOW THIS SCRIPT WORKS (step by step)
-------------------------------------
-  1. PROMPT / PARSE TARGET
-     The URL comes from `--url/-u` or an interactive prompt. It is normalized
-     to `scheme://host` and a `requests.Session` is built with TLS-verify off
-     (deliberate, for research against self-signed/misconfigured hosts).
-
-  2. CMS FINGERPRINTING        -> detect_cms()
-     Three signal layers are combined and scored (confidence: low/med/high):
-       - response HEADERS (e.g. X-Generator, X-Magento, Laravel, Symfony)
-       - <meta name="generator"> in the HTML body
-       - known PATH probes (wp-login.php, /administrator/, /user/login, ...)
-     Recognized: WordPress, Joomla, Drupal, Magento, Laravel, CodeIgniter,
-     Symfony, phpBB, PrestaShop, OpenCart, Typo3. Falls back to
-     "Unknown (generic PHP?)" when nothing matches.
-
-  3. PHP VERSION / TYPE        -> detect_php()
-       - VERSION from `X-Powered-By: PHP/x.y.z` (or generator meta fallback).
-       - TYPE from the `Server` header (e.g. "fpm" => PHP-FPM).
-       - SUPPORT STATUS mapped via PHP_SUPPORT -> php_support_status():
-         active / security-only / EOL. EOL branches (5.x/7.x/8.0/8.1) are
-         flagged because research indicates they will NOT receive an official
-         PHP2Shell fix.
-
-  4. CONFIRMATION GATE
-     Unless `--no-confirm` is passed, the user must approve before any
-     multipart probe is sent.
-
-  5. POISONING PRIMITIVE PROBE  -> probe_upload_progress() + build_poison_body()
-     A single multipart POST exercises both primitives with an INERT canary
-     (a `<?php /* ... */ ?>` comment — never a shell):
-       - field PHPSESSID=<sid>                     (P1: cookie-less session id)
-       - field PHP_SESSION_UPLOAD_PROGRESS=<canary> (P2: value injection)
-       - file upload whose filename = <canary>      (P2: filename injection)
-     If PHP replies with `Set-Cookie: PHPSESSID` (or any session cookie), P1
-     is CONFIRMED — PHP accepted the cookie-less session id.
-
-  6. EXPOSURE VERDICT          -> assess_vulnerability()
-     Combines the P1/P2 observation with the PHP support status to emit a
-     coarse, honest verdict:
-       LIKELY AFFECTED / POTENTIALLY AFFECTED / EOL PHP /
-       PRIMITIVE NOT OBSERVED / UNREACHABLE.
-     This is an ESTIMATE only — official affected/fixed versions are still
-     unpublished (NVD returns 0 results for both CVEs as of this writing).
-
-  7. OPTIONAL SINK SCAN        -> probe_include_sinks()   (--sink-scan)
-     Probes per-CMS candidate include()/LFI endpoints (read-only /etc/passwd
-     checks) that an operator would need to chain with the poisoned session
-     file to achieve actual RCE.
-
-
-OPERATION MODES (--mode)
--------------------------
-  IMPORTANT: NEITHER mode performs code execution. There is no RCE payload,
-  no shell upload, no file write, no gadget chain in this tool. Both modes
-  are purely OBSERVATIONAL — they only check whether the poisoning primitive
-  can be OBSERVED.
-
-  passive (default)  Minimally intrusive. One multipart probe with a plain
-                     PHP-comment canary. No code execution, no state beyond an
-                     ephemeral session marker. Recommended for assessment.
-
-  active             More aggressive OBSERVATION — still NON-destructive.
-                     Strengthens the probe so the primitive is more likely to
-                     be observable:
-                       - whitespace/newline-padded canary to defeat naive
-                         `<?php` prefix filters (stays a comment when parsed),
-                       - concurrent + large-body requests to race
-                         session.upload_progress.cleanup (default On) and widen
-                         the window where the poisoned session file exists.
-                     "active" means "actively probing", NOT "actively
-                     exploiting". It never uploads a shell, never writes files,
-                     never executes code.
-
-Research note: exploitation of this primitive into RCE requires (a) the race
-window to exist (cleanup off, or a sufficiently slow upload) and (b) an
-app-side include()/require() of the session file (an LFI sink). This tool
-verifies (a) and enumerates candidates for (b); it does not perform the RCE.
-
-
-DISCLAIMER
-----------
-This tool verifies an observable primitive and assesses exposure. It is not a
-weaponized RCE exploit, and it does not perform code execution against any
-target. Use responsibly and only within scope.
+Examples:
+    python3 script_test.py https://target.example
+    python3 script_test.py --no-safe-mode --workers 20 -i urls.txt --format json
+    python3 script_test.py -i urls.txt --proxy http://127.0.0.1:8080 --format csv
+    python3 script_test.py https://a.example --scheme both --fail-on unknown
 """
 
+from __future__ import annotations
+
 import argparse
+import csv
+import io
+import json
+import logging
+import pathlib
 import re
+import ssl
 import sys
 import time
-import uuid
-import urllib3
-import threading
-import requests
-from urllib.parse import urljoin, urlparse
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-USER_AGENT = "sudo3rs-PHP2Shell-Checker/1.4.0"
+# --- Advisory data, aligned with public research as of 2026-10-22 ------------
+# PHP2Shell: CVE-2026-109618 (OOM memory corruption, GHSA-w8hw-w9fx-j79w) and
+# CVE-2026-109619 (use-after-free, GHSA-6wmf-4rv5-p3rp). CVSS v4.0 9.2.
+# Vulnerable: PHP 5.4 through 8.5.11. First patched build per supported branch:
+FIXED_VERSIONS: dict[tuple[int, int], tuple[int, int, int]] = {
+    (8, 5): (8, 5, 12),
+    (8, 4): (8, 4, 27),
+    (8, 3): (8, 3, 36),
+    (8, 2): (8, 2, 35),
+}
+# Branches <= 8.1 are end-of-life: vulnerable with no official fix.
+EOL_CEILING = (8, 1)
+CVES = ["CVE-2026-109618", "CVE-2026-109619"]
+# Interim mitigation for EOL hosts (not a full fix): disable upload progress.
+MITIGATION = "session.upload_progress.enabled=0 + restart all PHP workers"
 
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# PHP's long-standing version-disclosure easter-egg query string. Appending it
+# to any PHP URL makes the interpreter emit a credit/logo page whose headers
+# leak the version even when expose_php hides it from normal responses.
+PHP_EGG_QUERY = "?=PHPE9568F34-D428-11d2-A769-00AA001ACF42"
 
-TIMEOUT = 15
+KEV_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+EPSS_URL = "https://api.first.org/data/v1/epss"
+CACHE_DIR = pathlib.Path.home() / ".cache" / "php2shell"
 
-# ---------------------------------------------------------------------------
-# Operation modes
-# ---------------------------------------------------------------------------
-# IMPORTANT: NEITHER mode performs code execution. This tool has no RCE
-# payload, no shell upload, no file write, and no gadget chain. Both modes are
-# purely observational — they only verify whether the session.upload_progress
-# poisoning primitive (P1 + P2) can be OBSERVED on the target.
-#
-# passive (default) — minimally intrusive. One multipart probe with a plain
-#         PHP-comment canary. No state beyond an ephemeral session marker.
-#
-# active  — more aggressive OBSERVATION (still non-destructive, no code exec).
-#         Uses a whitespace-padded canary to defeat naive `<?php` prefix
-#         filters, and races session.upload_progress.cleanup (default On) with
-#         concurrent + large-body requests to widen the window where the
-#         poisoned session file exists — purely so the primitive can be
-#         OBSERVED. It never executes anything; it only tries to WATCH the
-#         primitive land.
-#
-# The name "active" means "actively probing", NOT "actively exploiting".
-MODES = ("passive", "active")
+USER_AGENT = "php2shell-exposure-check/1.1 (authorized-testing)"
+MAX_BODY = 262_144  # bytes of HTML to sniff for CMS fingerprints
+log = logging.getLogger("php2shell-check")
 
-# ---------------------------------------------------------------------------
-# CMS fingerprint signatures
-# ---------------------------------------------------------------------------
+# --- Presentation ------------------------------------------------------------
+BANNER = r"""
+  ____  _   _ ____ ____  ____  _   _ _____ _     _
+ |  _ \| | | |  _ \___ \/ ___|| | | | ____| |   | |
+ | |_) | |_| | |_) |__) \___ \| |_| |  _| | |   | |
+ |  __/|  _  |  __// __/ ___) |  _  | |___| |___| |___
+ |_|   |_| |_|_|  |_____|____/|_| |_|_____|_____|_____|
+        P H P 2 S H E L L   ·   by sudo3rs
+   CVE-2026-109618 / CVE-2026-109619  —  exposure checker
+   Authorized testing only. Detection, not exploitation.
+"""
+
+# ANSI colors (disabled automatically when not a TTY, NO_COLOR, or --no-color).
+_COLORS = {
+    "reset": "\033[0m", "bold": "\033[1m", "dim": "\033[2m",
+    "red": "\033[31m", "green": "\033[32m", "yellow": "\033[33m",
+    "blue": "\033[34m", "magenta": "\033[35m", "cyan": "\033[36m",
+}
+_USE_COLOR = False
+
+
+def c(text: str, *styles: str) -> str:
+    if not _USE_COLOR:
+        return text
+    prefix = "".join(_COLORS.get(s, "") for s in styles)
+    return f"{prefix}{text}{_COLORS['reset']}" if prefix else text
+
+
+STATUS_STYLE = {"vulnerable": ("red", "bold"), "patched": ("green",),
+                "unknown": ("yellow",), "error": ("dim",)}
+
+
+# --- CMS fingerprinting ------------------------------------------------------
+# Each CMS: regexes against the landing-page HTML/headers (passive), plus
+# optional marker paths checked only in active mode. These identify the platform
+# that ships/embeds PHP; they do not probe for CMS-specific vulnerabilities.
+@dataclass
+class CmsSignature:
+    name: str
+    html_patterns: list[str]
+    active_paths: list[str] = field(default_factory=list)
+    version_pattern: str | None = None  # applied to HTML to grab a CMS version
+
+
 CMS_SIGNATURES = [
-    {
-        "name": "WordPress",
-        "generator": r"wordpress",
-        "headers": [r"wp-json", r"wordpress"],
-        "paths": [
-            ("/wp-login.php", {200, 301, 302}, r"(wp-login|wordpress|user_login|wp-submit)"),
-            ("/wp-includes/wlwmanifest.xml", {200, 301, 302}, r"(wlwmanifest|wordpress)"),
-            ("/wp-json/", {200, 301, 302}, r"(rest_|routes|namespace)"),
-            ("/xmlrpc.php", {200, 405, 301, 302}, r"(XML-RPC|methodCall|incorrect_method)"),
-        ],
-    },
-    {
-        "name": "Joomla",
-        "generator": r"joomla",
-        "headers": [r"joomla"],
-        "paths": [
-            ("/administrator/", {200, 301, 302}, r"(joomla|Joomla|mod_login|com_login)"),
-            ("/media/system/js/core.js", {200}, r"(Drupal|Joomla|MooTools|Media\\.system)"),
-        ],
-    },
-    {
-        "name": "Drupal",
-        "generator": r"drupal",
-        "headers": [r"x-generator.*drupal", r"x-drupal"],
-        "paths": [
-            ("/user/login", {200, 301, 302}, r"(user-login|Drupal|form_id.*user_login|drupal)"),
-            ("/misc/drupal.js", {200}, r"(Drupal|drupal)"),
-        ],
-    },
-    {
-        "name": "Magento",
-        "generator": r"magento",
-        "headers": [r"x-magento"],
-        "paths": [
-            ("/admin", {200, 301, 302, 401}, r"(magento|Magento|adminhtml)"),
-            ("/skin/frontend/", {200, 301, 302}, r"(magento|Magento|skin|frontend)"),
-        ],
-    },
-    {
-        "name": "Laravel",
-        "generator": r"laravel",
-        "headers": [r"laravel"],
-        "paths": [
-            ("/login", {200, 301, 302}, r"(laravel|Laravel|csrf-token|_token)"),
-        ],
-    },
-    {
-        "name": "CodeIgniter",
-        "generator": r"codeigniter",
-        "headers": [r"codeigniter"],
-        "paths": [("/index.php", {200, 301, 302}, r"(codeigniter|CodeIgniter)")],
-    },
-    {
-        "name": "Symfony",
-        "generator": r"symfony",
-        "headers": [r"symfony", r"x-debug-token"],
-        "paths": [("/_profiler", {200, 301, 302}, r"(symfony|Symfony|token)")],
-    },
-    {
-        "name": "phpBB",
-        "generator": r"phpbb",
-        "headers": [r"phpbb"],
-        "paths": [("/ucp.php", {200, 301, 302}, r"(phpbb|phpBB)")],
-    },
-    {
-        "name": "PrestaShop",
-        "generator": r"prestashop",
-        "headers": [r"prestashop", r"ps-"],
-        "paths": [
-            ("/index.php?controller=authentication", {200, 301, 302}, r"(prestashop|PrestaShop)"),
-        ],
-    },
-    {
-        "name": "OpenCart",
-        "generator": r"opencart",
-        "headers": [],
-        "paths": [
-            ("/index.php?route=account/login", {200, 301, 302}, r"(opencart|OpenCart)"),
-        ],
-    },
-    {
-        "name": "Typo3",
-        "generator": r"typo3",
-        "headers": [r"typo3"],
-        "paths": [("/typo3/", {200, 301, 302, 401}, r"(typo3|TYPO3)")],
-    },
-]
-
-# ---------------------------------------------------------------------------
-# PHP support lifecycle (for EOL exposure assessment)
-# ---------------------------------------------------------------------------
-# Sources: php.net/supported-versions, herodevs, tuxcare (as of 2026).
-# Key insight from PHP2Shell research: only supported branches (8.2+) will
-# receive an official fix. EOL branches (5.x/7.x/8.0/8.1) get NO fix.
-PHP_SUPPORT = [
-    ("8.6", "active",    "in development (RC)"),
-    ("8.5", "active",    "supported — will get fix"),
-    ("8.4", "active",    "supported — will get fix"),
-    ("8.3", "security",  "security-only — will get fix"),
-    ("8.2", "security",  "security-only — will get fix (EOL 2026-12-31)"),
-    ("8.1", "eol",       "EOL — NO official fix expected"),
-    ("8.0", "eol",       "EOL — NO official fix expected"),
-    ("7.4", "eol",       "EOL — NO official fix expected"),
-    ("7.3", "eol",       "EOL — NO official fix expected"),
-    ("7.2", "eol",       "EOL — NO official fix expected"),
-    ("7.1", "eol",       "EOL — NO official fix expected"),
-    ("7.0", "eol",       "EOL — NO official fix expected"),
-    ("5.6", "eol",       "EOL — NO official fix expected"),
-    ("5.5", "eol",       "EOL — NO official fix expected"),
-    ("5.4", "eol",       "EOL — NO official fix expected"),
-    ("5.3", "eol",       "EOL — NO official fix expected"),
-    ("5.2", "eol",       "EOL — NO official fix expected"),
+    CmsSignature("WordPress",
+                 [r'<meta name="generator" content="WordPress ?(\d[\d.]*)',
+                  r"/wp-content/", r"/wp-includes/"],
+                 ["/wp-login.php", "/readme.html"],
+                 r"WordPress ?(\d[\d.]*)"),
+    CmsSignature("Joomla",
+                 [r'<meta name="generator" content="Joomla!? ?(\d[\d.]*)', r"/media/jui/"],
+                 ["/administrator/manifests/files/joomla.xml"],
+                 r"Joomla!? ?(\d[\d.]*)"),
+    CmsSignature("Drupal",
+                 [r'<meta name="Generator" content="Drupal ?(\d[\d.]*)', r"/sites/default/files/", r"Drupal\.settings"],
+                 ["/CHANGELOG.txt", "/core/CHANGELOG.txt"],
+                 r"Drupal ?(\d[\d.]*)"),
+    CmsSignature("Magento", [r"Mage\.Cookies", r"/static/version\d+/", r"/skin/frontend/"], ["/magento_version"]),
+    CmsSignature("TYPO3", [r"/typo3conf/", r'<meta name="generator" content="TYPO3']),
+    CmsSignature("PrestaShop", [r"/modules/", r"var prestashop", r"PrestaShop"]),
+    CmsSignature("Laravel", [r"laravel_session", r"XSRF-TOKEN"]),
+    CmsSignature("phpBB", [r"phpBB", r"/styles/prosilver/"]),
+    CmsSignature("MediaWiki", [r'<meta name="generator" content="MediaWiki ?(\d[\d.]*)'], [], r"MediaWiki ?(\d[\d.]*)"),
+    CmsSignature("Plesk", [r"Plesk", r"/plesk-site-preview/"]),
 ]
 
 
-def php_support_status(version):
-    """Map a detected PHP version string to a support-status dict."""
-    if not version:
-        return None
-    m = re.match(r"(\d+)\.(\d+)", version)
-    if not m:
-        return None
-    major, minor = int(m.group(1)), int(m.group(2))
-    branch = f"{major}.{minor}"
-    # Find the closest known branch (prefix match on minor, then fall back)
-    for known, status, note in PHP_SUPPORT:
-        k_major, k_minor = known.split(".")
-        if int(k_major) == major and int(k_minor) == minor:
-            return {"branch": known, "status": status, "note": note}
-    # Unknown minor: infer from major
-    if major >= 8:
-        if minor >= 2:
-            return {"branch": branch, "status": "supported", "note": "assumed supported (8.2+)"}
-        return {"branch": branch, "status": "eol", "note": "assumed EOL (< 8.2)"}
-    return {"branch": branch, "status": "eol", "note": "assumed EOL (< 8.2)"}
+@dataclass
+class Result:
+    url: str
+    final_url: str | None = None
+    checked_at: str = ""
+    php_version: str | None = None
+    php_detected: bool = False
+    version_source: str | None = None
+    cms: str | None = None
+    cms_version: str | None = None
+    cms_source: str | None = None
+    server: str | None = None
+    evidence: str = ""
+    status: str = "unknown"  # vulnerable | patched | unknown | error
+    reason: str = ""
+    cves: list[str] = field(default_factory=lambda: list(CVES))
+    recommendation: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Per-CMS candidate include()/LFI sink signatures
-# ---------------------------------------------------------------------------
-# Common include-style / LFI endpoints per CMS that could be chained with a
-# poisoned session file for actual RCE. None is a guaranteed sink; these are
-# candidates an operator inspects. Read-only /etc/passwd probes only.
-CMS_SINK_SIGNATURES = {
-    "WordPress": [
-        ("/wp-content/plugins/akismet/readme.txt", r"akismet|wordpress"),
-        ("/wp-includes/version.php", r"wp_version"),
-        ("/index.php?p=../../../../etc/passwd", r"root:x:0:0"),
-        ("/?page=../../../../etc/passwd", r"root:x:0:0"),
-    ],
-    "Joomla": [
-        ("/index.php?option=com_content&view=../../../../etc/passwd", r"root:x:0:0"),
-        ("/index.php?lang=../../../../etc/passwd", r"root:x:0:0"),
-    ],
-    "Drupal": [
-        ("/index.php?q=../../../../etc/passwd", r"root:x:0:0"),
-        ("/CHANGELOG.txt", r"drupal"),
-    ],
-    "Magento": [
-        ("/index.php/?file=../../../../etc/passwd", r"root:x:0:0"),
-    ],
-    "Laravel": [
-        ("/?file=../../../../etc/passwd", r"root:x:0:0"),
-        ("/index.php?page=../../../../etc/passwd", r"root:x:0:0"),
-    ],
-    "default": [
-        ("/index.php?page=../../../../etc/passwd", r"root:x:0:0"),
-        ("/index.php?file=../../../../etc/passwd", r"root:x:0:0"),
-        ("/index.php?lang=../../../../etc/passwd", r"root:x:0:0"),
-        ("/download.php?file=../../../../etc/passwd", r"root:x:0:0"),
-    ],
-}
+@dataclass
+class Intel:
+    """Live threat-intel context for the two CVEs (report-level, not per host)."""
+    in_kev: bool | None = None
+    kev_date_added: str | None = None
+    epss: dict[str, float] = field(default_factory=dict)
+    note: str = "intel not fetched"
 
 
-# ---------------------------------------------------------------------------
-# Terminal colors
-# ---------------------------------------------------------------------------
-class C:
-    enabled = sys.stdout.isatty()
+# --- HTTP client -------------------------------------------------------------
+@dataclass
+class HttpClient:
+    timeout: float = 15.0
+    insecure: bool = False
+    retries: int = 2           # extra attempts after the first
+    backoff: float = 1.5       # seconds, multiplied each retry
+    proxy: str | None = None
+    extra_headers: dict[str, str] = field(default_factory=dict)
+    user_agent: str = USER_AGENT
 
-    @staticmethod
-    def _wrap(code, text):
-        return f"\033[{code}m{text}\033[0m" if C.enabled else text
+    def _opener(self) -> urllib.request.OpenerDirector:
+        ctx = ssl.create_default_context()
+        if self.insecure:
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        handlers: list[urllib.request.BaseHandler] = [urllib.request.HTTPSHandler(context=ctx)]
+        if self.proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy}))
+        return urllib.request.build_opener(*handlers)
 
-    @staticmethod
-    def red(t):     return C._wrap("31", t)
-    @staticmethod
-    def green(t):   return C._wrap("32", t)
-    @staticmethod
-    def yellow(t):  return C._wrap("33", t)
-    @staticmethod
-    def blue(t):    return C._wrap("34", t)
-    @staticmethod
-    def magenta(t): return C._wrap("35", t)
-    @staticmethod
-    def cyan(t):    return C._wrap("36", t)
-    @staticmethod
-    def bold(t):    return C._wrap("1", t)
-    @staticmethod
-    def dim(t):     return C._wrap("2", t)
+    def _headers(self) -> dict[str, str]:
+        return {"User-Agent": self.user_agent, **self.extra_headers}
 
+    def fetch(self, url: str, want_body: bool) -> tuple[int, dict[str, str], str]:
+        """Return (status, lowercased-headers, body) with retry/backoff.
 
-def banner():
-    print(C.cyan(C.bold("""
-    ┌───────────────────────────────────────────────────────────────┐
-    │  PHP2Shell  (CVE-2026-109618 / CVE-2026-109619)               │
-    │  by sudo3rs — internal research tool                          │
-    │  session.upload_progress poisoning + detection                │
-    └───────────────────────────────────────────────────────────────┘
-    """)))
-
-
-# ---------------------------------------------------------------------------
-# URL handling
-# ---------------------------------------------------------------------------
-def normalize_url(raw):
-    raw = raw.strip()
-    if not raw:
-        return None
-    if not raw.startswith(("http://", "https://")):
-        raw = "http://" + raw
-    parsed = urlparse(raw)
-    if not parsed.netloc:
-        return None
-    scheme = parsed.scheme or "http"
-    return f"{scheme}://{parsed.netloc}"
-
-
-def prompt_url(args_url):
-    if args_url:
-        url = normalize_url(args_url)
-        if url:
-            print(C.green(f"[+] Target URL : {url}"))
-            return url
-        print(C.red("[!] Invalid URL passed via --url, falling back to prompt."))
-
-    while True:
-        raw = input(C.cyan("[?] Enter target URL (empty = quit): ")).strip()
-        if raw.lower() in ("exit", "quit", "q", ""):
-            return None
-        url = normalize_url(raw)
-        if url:
-            return url
-        print(C.red("[!] Invalid URL. Use format example.com or https://example.com"))
-
-
-def make_session():
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
-    s.verify = False
-    return s
-
-
-# ---------------------------------------------------------------------------
-# CMS detection
-# ---------------------------------------------------------------------------
-def detect_cms(base_url, session):
-    evidence = []
-    scores = {}
-
-    def add(name, msg):
-        evidence.append(f"[{name}] {msg}")
-        scores[name] = scores.get(name, 0) + 1
-
-    try:
-        r = session.get(base_url + "/", timeout=TIMEOUT)
-        homepage_ok = True
-    except requests.RequestException as e:
-        print(C.yellow(f"[!] Homepage request failed: {e}"))
-        homepage_ok = False
-        r = None
-
-    if homepage_ok and r is not None:
-        body = r.text or ""
-        headers_lower = {k.lower(): v for k, v in r.headers.items()}
-        joined = " ".join(headers_lower.values())
-
-        for sig in CMS_SIGNATURES:
-            for h in sig["headers"]:
-                if re.search(h, joined, re.IGNORECASE):
-                    add(sig["name"], f"header match: {h}")
-
-        gen_match = re.search(
-            r'<meta[^>]+name=["\']generator["\'][^>]+content=["\']([^"\']+)["\']',
-            body, re.IGNORECASE,
-        )
-        if gen_match:
-            gen_val = gen_match.group(1)
-            for sig in CMS_SIGNATURES:
-                if re.search(sig["generator"], gen_val, re.IGNORECASE):
-                    add(sig["name"], f"generator meta: {gen_val}")
-
-        if "wp-content" in body or "wp-includes" in body:
-            add("WordPress", "body references wp-content/wp-includes")
-
-    # Generic "not found" / error signatures that invalidate a path probe
-    # match. Prevents false positives from servers that return 200 with an
-    # error/soft-404 page for unknown paths (e.g. PHP built-in server).
-    _404_PATTERNS = [
-        r"404\s+(page\s+)?not\s+found",
-        r"page\s+not\s+found",
-        r"not\s+found",
-        r"no\s+input\s+file\s+specified",
-        r"file\s+not\s+found",
-    ]
-
-    def _looks_like_404(text):
-        low = (text or "").lower()
-        for p in _404_PATTERNS:
-            if re.search(p, low):
-                return True
-        return False
-
-    for sig in CMS_SIGNATURES:
-        for path, ok_status, needle in sig["paths"]:
-            url = urljoin(base_url + "/", path.lstrip("/"))
-            try:
-                pr = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-            except requests.RequestException:
-                continue
-            if pr.status_code not in ok_status:
-                continue
-            text = pr.text or ""
-            # Skip if this looks like a generic 404/error page.
-            if _looks_like_404(text):
-                continue
-            # A needle is now mandatory: a bare 200 with no content match is
-            # too weak a signal and causes false positives.
-            if needle and re.search(needle, text, re.IGNORECASE):
-                add(sig["name"], f"path {path} -> {pr.status_code}")
-
-    if not scores:
-        return {"name": "Unknown (generic PHP?)", "confidence": "low",
-                "evidence": evidence or ["no CMS signatures matched"]}
-
-    best = max(scores, key=lambda k: scores[k])
-    total = scores[best]
-    confidence = "high" if total >= 3 else ("medium" if total == 2 else "low")
-    return {"name": best, "confidence": confidence, "evidence": evidence}
-
-
-# ---------------------------------------------------------------------------
-# Per-CMS behavior / version probes
-# ---------------------------------------------------------------------------
-# Deeper, behavior-based fingerprints: static files that leak an exact CMS
-# version, API endpoints, and generated assets. Each entry maps a CMS name to
-# a list of (path, needle) probes; a match yields "name + version/behavior".
-CMS_BEHAVIOR_PROBES = {
-    "WordPress": [
-        ("/wp-links-opml.php", r"<generator>http://wordpress\\.org/\\?v=([\\d.]+)"),
-        ("/readme.html", r"Version\\s+([\\d.]+)"),
-        ("/wp-includes/version.php", r"wp_version\\s*=\\s*'([\\d.]+)'"),
-        ("/wp-json/wp/v2/", r'\"namespace\":\\s*\"wp/v2\"'),
-    ],
-    "Joomla": [
-        ("/language/en-GB/en-GB.xml", r"<version>([\\d.]+)</version>"),
-        ("/administrator/manifests/files/joomla.xml", r"<version>([\\d.]+)</version>"),
-    ],
-    "Drupal": [
-        ("/CHANGELOG.txt", r"Drupal\\s+([\\d.]+)"),
-        ("/core/CHANGELOG.txt", r"Drupal\\s+([\\d.]+)"),
-    ],
-    "Magento": [
-        ("/magento_version", r"Magento/([\\d.]+)"),
-        ("/RELEASE_NOTES.txt", r"Magento\\s+([\\d.]+)"),
-    ],
-    "PrestaShop": [
-        ("/config/xml/default_country_modules_list.xml", r"<version>([\\d.]+)</version>"),
-    ],
-    "OpenCart": [
-        ("/index.php?route=common/home", r"opencart"),
-    ],
-    "phpBB": [
-        ("/docs/CHANGELOG.html", r"phpBB\\s+([\\d.]+)"),
-    ],
-}
-
-
-def detect_cms_behavior(base_url, session, cms_name):
-    """Return a list of (probe_path, matched_text) for deeper, behavior-level
-    CMS version/asset detection. Complements detect_cms() for the winning CMS.
-    """
-    probes = CMS_BEHAVIOR_PROBES.get(cms_name)
-    if not probes:
-        return []
-    findings = []
-    for path, needle in probes:
-        url = urljoin(base_url + "/", path.lstrip("/"))
-        try:
-            r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-        except requests.RequestException:
-            continue
-        if r.status_code != 200:
-            continue
-        m = re.search(needle, r.text or "")
-        if m:
-            val = m.group(1) if m.lastindex else "present"
-            findings.append((path, val))
-    return findings
-
-
-# ---------------------------------------------------------------------------
-# PHP version / type detection
-# ---------------------------------------------------------------------------
-def detect_php(base_url, session):
-    result = {"version": None, "type": None, "support": None, "evidence": []}
-
-    def add(msg):
-        result["evidence"].append(msg)
-
-    try:
-        r = session.get(base_url + "/", timeout=TIMEOUT)
-        h = {k.lower(): v for k, v in r.headers.items()}
-        x_powered = h.get("x-powered-by")
-        if x_powered:
-            add(f"X-Powered-By: {x_powered}")
-            m = re.search(r"PHP/([\d.]+)", x_powered, re.IGNORECASE)
-            if m:
-                result["version"] = m.group(1)
-        server = h.get("server", "")
-        if re.search(r"fpm", server, re.IGNORECASE):
-            result["type"] = "PHP-FPM"
-            add(f"Server header suggests PHP-FPM: {server}")
-    except requests.RequestException as e:
-        add(f"header probe failed: {e}")
-
-    try:
-        r = session.get(base_url + "/", timeout=TIMEOUT)
-        body = r.text or ""
-    except requests.RequestException:
-        body = ""
-
-    m = re.search(
-        r'<meta[^>]+name=["\']generator["\'][^>]+content=["\'][^"\']*PHP[/ ]([\d.]+)',
-        body, re.IGNORECASE,
-    )
-    if m and not result["version"]:
-        result["version"] = m.group(1)
-        add(f"generator meta suggests PHP {m.group(1)}")
-
-    result["support"] = php_support_status(result["version"])
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Defensive config exposure (memory-bug feasibility) — observational only
-# ---------------------------------------------------------------------------
-def detect_config_exposure(base_url, session):
-    """
-    Assess the *conditions* that the PHP2Shell memory-corruption class needs,
-    using only passive/observable signals. This is DEFENSIVE intel: it tells
-    a defender whether the target's configuration would make the bug
-    reachable, without exercising any memory corruption.
-
-    Signals gathered (all read-only):
-      - session.upload_progress.enabled  (via target-side reflection, if any)
-      - session.upload_progress.cleanup  (race-window feasibility)
-      - memory_limit vs post_max_size    (OOM-bailout feasibility)
-      - SAPI hints (Apache/prefork vs FPM/CGI/LSAPI survival semantics)
-    """
-    result = {"upload_progress": None, "cleanup": None,
-              "memory_limit": None, "post_max_size": None,
-              "sapi": None, "notes": []}
-
-    def add(msg):
-        result["notes"].append(msg)
-
-    # 1. PHP config reflection endpoints (a target may expose these; absence
-    #    is NOT a finding — we only read what the target itself offers).
-    reflection_paths = [
-        "/?phpinfo=1",
-        "/phpinfo.php",
-        "/info.php",
-        "/_profiler/phpinfo",
-    ]
-    phpinfo_html = ""
-    for p in reflection_paths:
-        url = urljoin(base_url + "/", p.lstrip("/"))
-        try:
-            r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-        except requests.RequestException:
-            continue
-        if r.status_code == 200 and ("phpinfo" in (r.text or "").lower()
-                                     or "directive" in (r.text or "").lower()):
-            phpinfo_html = r.text or ""
-            add(f"phpinfo reflected via {p}")
-            break
-
-    if phpinfo_html:
-        m = re.search(r'session\.upload_progress\.enabled[^<]*<td[^>]*>([^<]+)<', phpinfo_html, re.I)
-        if m:
-            result["upload_progress"] = m.group(1).strip()
-        m = re.search(r'session\.upload_progress\.cleanup[^<]*<td[^>]*>([^<]+)<', phpinfo_html, re.I)
-        if m:
-            result["cleanup"] = m.group(1).strip()
-        m = re.search(r'memory_limit[^<]*<td[^>]*>([^<]+)<', phpinfo_html, re.I)
-        if m:
-            result["memory_limit"] = m.group(1).strip()
-        m = re.search(r'post_max_size[^<]*<td[^>]*>([^<]+)<', phpinfo_html, re.I)
-        if m:
-            result["post_max_size"] = m.group(1).strip()
-
-    # 2. SAPI hint from headers / error pages (survival semantics: prefork
-    #    survives a pre-RINIT bailout; FPM/CGI/LSAPI typically do not).
-    try:
-        r = session.get(base_url + "/", timeout=TIMEOUT)
-        h = {k.lower(): v for k, v in r.headers.items()}
-        server = h.get("server", "")
-        if re.search(r"apache", server, re.I):
-            result["sapi"] = "Apache (likely prefork/mod_php)"
-        elif re.search(r"fpm|nginx", server, re.I):
-            result["sapi"] = "PHP-FPM (via nginx/Apache)"
-        elif re.search(r"litespeed|lsapi", server, re.I) or "litespeed" in server.lower():
-            result["sapi"] = "LiteSpeed (LSAPI)"
-        elif re.search(r"cgi", server, re.I):
-            result["sapi"] = "CGI/FastCGI"
-        if result["sapi"]:
-            add(f"SAPI hint: {result['sapi']}")
-    except requests.RequestException:
-        pass
-
-    # 3. Interpret: feasibility notes (defensive framing only)
-    if result["upload_progress"] is not None:
-        up = result["upload_progress"].lower()
-        if "off" in up or up == "0":
-            add("upload_progress DISABLED — primitive closed (mitigated).")
-        else:
-            add("upload_progress ENABLED — primitive reachable.")
-    if result["cleanup"] is not None:
-        cl = result["cleanup"].lower()
-        if "off" in cl or cl == "0":
-            add("cleanup OFF — no race needed (larger window).")
-        else:
-            add("cleanup ON (default) — exploitation would be a race.")
-    if result["memory_limit"] and result["post_max_size"]:
-        add(f"memory_limit={result['memory_limit']} vs post_max_size={result['post_max_size']} "
-            f"(OOM-bailout feasibility is config-dependent).")
-
-    return result
-def make_canary(mode):
-    """Return an inert canary string.
-
-    passive — a plain PHP comment; unmistakably inert, never executes.
-    active  — still a comment (never a shell), but wrapped with leading
-              whitespace/newlines so it survives naive string filters that
-              block `<` immediately followed by `?php`. The whitespace is
-              stripped by the PHP tokenizer, so the canary remains inert.
-    """
-    tag = uuid.uuid4().hex[:8]
-    if mode == "active":
-        # Whitespace / newline padding defeats simple `<?php`-prefix filters
-        # while remaining a comment once PHP parses it.
-        return (f"\\n    <?php /* php2shell canary {tag} - inert, no shell */ ?>")\
-            .replace("\\n", "\r\n")
-    return f"<?php /* php2shell inert canary {tag} - NOT a shell */ ?>"
-
-
-def build_poison_body(boundary, sid, canary, slow_stream=False):
-    """Build a multipart body that exercises P1 (cookie-less session id) and
-    P2 (progress marker + filename carrying an inert canary).
-
-    When slow_stream is True (active race mode), the body appends a large
-    trailing file part so the upload lingers, widening the window where the
-    poisoned session file exists before session.upload_progress.cleanup runs.
-    """
-    def part(disp, value):
-        return (f"--{boundary}\r\nContent-Disposition: form-data; {disp}\r\n\r\n"
-                f"{value}\r\n").encode("utf-8")
-
-    body = b""
-    body += part('name="PHPSESSID"', sid)                       # P1
-    body += part('name="PHP_SESSION_UPLOAD_PROGRESS"', canary)  # P2 (value)
-    body += (f"--{boundary}\r\n"
-             f'Content-Disposition: form-data; name="file1"; filename="{canary}"\r\n'
-             f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
-    body += b"CANARYDATA\r\n"
-
-    if slow_stream:
-        # A large filler part keeps the multipart stream open longer,
-        # extending the lifetime of the progress session entry (race window).
-        body += (f"--{boundary}\r\n"
-                 f'Content-Disposition: form-data; name="filler"; filename="f.bin"\r\n'
-                 f"Content-Type: application/octet-stream\r\n\r\n").encode("utf-8")
-        body += b"A" * (512 * 1024)  # 512 KiB of filler
-        body += b"\r\n"
-
-    body += f"--{boundary}--\r\n".encode("utf-8")
-    return body
-
-
-def probe_upload_progress(base_url, session, probe_path, mode="passive"):
-    """
-    Send the poisoning primitive to the target and report observations.
-
-    mode="passive" — single inert probe.
-    mode="active"  — inert probe + concurrent requests racing against
-                     session.upload_progress.cleanup to make the poisoned
-                     session file observable. Still NO code execution.
-
-    Returns a dict of observations.
-    """
-    sid = "s3rs" + uuid.uuid4().hex[:24]
-    canary = make_canary(mode)
-    boundary = "----php2shell" + uuid.uuid4().hex
-    url = urljoin(base_url + "/", probe_path.lstrip("/"))
-
-    obs = {"sid": sid, "canary": canary, "status": None,
-           "php_session_set": None, "p1_via": None, "x_powered_by": None,
-           "session_name": "PHPSESSID", "progress_marker_seen": None,
-           "mode": mode, "requests_sent": 0, "notes": []}
-
-    def _send(slow):
-        body = build_poison_body(boundary, sid, canary, slow_stream=slow)
-        headers = {
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-            "Content-Length": str(len(body)),
-        }
-        return session.post(url, data=body, headers=headers,
-                            timeout=TIMEOUT, allow_redirects=False)
-
-    try:
-        if mode == "active":
-            # Race: one slow (large) request to keep the session entry alive,
-            # plus several concurrent quick requests to widen the window and
-            # increase the chance of observing the primitive landing.
-            slow_thread = threading.Thread(
-                target=lambda: _send(slow=True), daemon=True)
-            slow_thread.start()
-            time.sleep(0.05)
-            results = []
-            for _ in range(4):
+        A 4xx/5xx is a valid response and returned immediately. Only transport
+        errors (DNS, timeout, reset) are retried; the last one is raised as
+        RuntimeError. A fresh opener per call keeps this thread-safe.
+        """
+        opener = self._opener()
+        methods = ("GET",) if want_body else ("HEAD", "GET")
+        last_exc: Exception | None = None
+        for attempt in range(self.retries + 1):
+            for method in methods:
+                req = urllib.request.Request(url, method=method, headers=self._headers())
                 try:
-                    results.append(_send(slow=False))
-                except requests.RequestException:
-                    pass
-            slow_thread.join(timeout=TIMEOUT)
-            obs["requests_sent"] = len(results)
-            resp = results[0] if results else None
-            if resp is None:
-                resp = _send(slow=False)
-        else:
-            resp = _send(slow=False)
-            obs["requests_sent"] = 1
+                    with opener.open(req, timeout=self.timeout) as resp:
+                        body = resp.read(MAX_BODY).decode("utf-8", "replace") if want_body else ""
+                        return resp.status, {k.lower(): v for k, v in resp.headers.items()}, body
+                except urllib.error.HTTPError as exc:
+                    body = exc.read(MAX_BODY).decode("utf-8", "replace") if want_body else ""
+                    return exc.code, {k.lower(): v for k, v in exc.headers.items()}, body
+                except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                    last_exc = exc  # try next method, then retry
+            if attempt < self.retries:
+                wait = self.backoff * (attempt + 1)
+                log.info("retry %d/%d for %s in %.1fs (%s)", attempt + 1, self.retries, url, wait, last_exc)
+                time.sleep(wait)
+        raise RuntimeError(str(last_exc))
 
-        if resp is None:
-            obs["notes"].append("all requests failed")
-            return obs
-
-        obs["status"] = resp.status_code
-        obs["notes"].append(f"POST {url} -> HTTP {resp.status_code}")
-        if mode == "active":
-            obs["notes"].append(f"race mode: {obs['requests_sent']} probe requests sent")
-        resp_body = resp.text or ""
-
-        # --- P1 detection ---
-        # Primary signal: Set-Cookie PHPSESSID (Apache/FPM return a real
-        # cookie after accepting the cookie-less session id).
-        for c in resp.cookies:
-            if c.name.upper() in ("PHPSESSID", "SESSID") or \
-               (c.name and "sess" in c.name.lower()):
-                obs["php_session_set"] = c.value
-                obs["session_name"] = c.name
-                obs["p1_via"] = "cookie"
-                obs["notes"].append(f"Set-Cookie: {c.name}={c.value[:16]}...")
-                break
-
-        # Secondary signal: some targets (e.g. PHP built-in server, or apps
-        # that echo session_id()) expose the session id in the body instead of
-        # a cookie. If our exact sid is echoed back, P1 is also confirmed.
-        if not obs["php_session_set"] and sid in resp_body:
-            obs["php_session_set"] = sid
-            obs["p1_via"] = "body-echo"
-            obs["notes"].append("Session id echoed in response body (P1 accepted).")
-
-        # P2 corroboration: the target itself reports the upload-progress marker.
-        if re.search(r"PROGRESS_MARKER_SEEN|upload_progress_", resp_body):
-            obs["progress_marker_seen"] = True
-            obs["notes"].append("Target confirms PHP_SESSION_UPLOAD_PROGRESS marker was seen.")
-
-        # Expose PHP version in headers (fingerprint corroboration)
-        xp = resp.headers.get("X-Powered-By")
-        if xp:
-            obs["x_powered_by"] = xp
-            obs["notes"].append(f"X-Powered-By: {xp}")
-
-        # Heuristic: if the target returned a normal page (200) AND echoed a
-        # session cookie, upload_progress processing ran (feature enabled).
-        # A 403/415 from a WAF/filter suggests multipart is being blocked.
-        if resp.status_code in (403, 415):
-            obs["notes"].append("Response 403/415 — multipart may be blocked by WAF/edge rule.")
-
-    except requests.RequestException as e:
-        obs["notes"].append(f"request error: {e}")
-
-    return obs
+    def get_json(self, url: str) -> dict:
+        """Fetch and parse a full JSON document (no body-size cap, with retry)."""
+        opener = self._opener()
+        last_exc: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                req = urllib.request.Request(url, headers=self._headers())
+                with opener.open(req, timeout=self.timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8", "replace"))
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                last_exc = exc
+                if attempt < self.retries:
+                    time.sleep(self.backoff * (attempt + 1))
+        raise RuntimeError(str(last_exc))
 
 
-def assess_vulnerability(obs, php):
-    """
-    Produce a coarse exposure verdict by combining the observed primitive
-    behaviour with the detected PHP branch. This is an ESTIMATE, not a proof:
-    official affected/fixed versions are still unpublished.
-    """
-    verdict = {"label": "UNKNOWN", "color": "yellow", "reasons": []}
-
-    p1 = bool(obs.get("php_session_set"))
-
-    # 1. P1/P2 primitive observed (upload_progress enabled + session reachable)
-    if p1:
-        verdict["reasons"].append("session.upload_progress engaged (Set-Cookie returned)")
-
-    # 2. PHP branch support status
-    sup = php.get("support")
-    if sup:
-        verdict["reasons"].append(f"PHP {sup['branch']} is {sup['status']} ({sup['note']})")
-        if sup["status"] == "eol":
-            verdict["reasons"].append("EOL branch: no official PHP2Shell fix expected")
-
-    # 3. Combine
-    if p1 and sup and sup["status"] == "eol":
-        verdict["label"] = "LIKELY AFFECTED (primitive + EOL PHP)"
-        verdict["color"] = "red"
-    elif p1:
-        verdict["label"] = "POTENTIALLY AFFECTED (primitive confirmed, PHP supported)"
-        verdict["color"] = "yellow"
-    elif sup and sup["status"] == "eol":
-        verdict["label"] = "EOL PHP (patch exposure) — primitive not observed"
-        verdict["color"] = "yellow"
-    elif not p1 and obs.get("status") is None:
-        verdict["label"] = "UNREACHABLE"
-        verdict["color"] = "red"
-    else:
-        verdict["label"] = "PRIMITIVE NOT OBSERVED (may be mitigated/patched)"
-        verdict["color"] = "green"
-
-    return verdict
+# --- Fingerprinting ----------------------------------------------------------
+def extract_php_version(headers: dict[str, str]) -> str | None:
+    for header in ("x-powered-by", "server"):
+        if m := re.search(r"PHP/(\d+\.\d+\.\d+)", headers.get(header, ""), re.IGNORECASE):
+            return m.group(1)
+    return None
 
 
-# ---------------------------------------------------------------------------
-# Candidate include() sink probe (the chain required for actual RCE)
-# ---------------------------------------------------------------------------
-def probe_include_sinks(base_url, session, cms_name="default"):
-    """Check for candidate include()/LFI sinks that could be chained with a
-    poisoned session file. CMS-aware; falls back to a default list.
-    Read-only /etc/passwd probes only."""
-    candidates = CMS_SINK_SIGNATURES.get(cms_name, CMS_SINK_SIGNATURES["default"])
-    hits = []
-    for path, needle in candidates:
-        url = urljoin(base_url + "/", path.lstrip("/"))
+def php_is_present(headers: dict[str, str], body: str) -> bool:
+    """True if the host looks PHP-backed even when the version is hidden."""
+    blob = " ".join(headers.get(h, "") for h in ("server", "x-powered-by", "set-cookie"))
+    if re.search(r"\bPHP\b|PHPSESSID", blob, re.IGNORECASE):
+        return True
+    return bool(re.search(r"\.php(?:[\"'?/ >]|$)", body, re.IGNORECASE))
+
+
+def detect_cms(headers: dict[str, str], body: str,
+               signatures: list[CmsSignature]) -> tuple[str | None, str | None, str | None]:
+    """Return (cms, cms_version, source) from headers + landing-page HTML."""
+    haystack = body + "\n" + "\n".join(f"{k}: {v}" for k, v in headers.items())
+    for sig in signatures:
+        for pat in sig.html_patterns:
+            if m := re.search(pat, haystack, re.IGNORECASE):
+                version = None
+                if sig.version_pattern and (vm := re.search(sig.version_pattern, haystack, re.IGNORECASE)):
+                    version = vm.group(1) or None
+                elif m.groups() and m.group(1):
+                    version = m.group(1)
+                if version and not re.search(r"\d", version):  # reject e.g. "."
+                    version = None
+                return sig.name, version.strip(".") if version else None, "landing page"
+    # Header hints whose mere presence implies a platform (value is not a name).
+    for hdr, name in (("x-drupal-cache", "Drupal"), ("x-drupal-dynamic-cache", "Drupal")):
+        if hdr in headers:
+            return name, None, f"header {hdr}"
+    # Headers whose value names the generator (e.g. "Drupal 10 (https://...)").
+    for hdr in ("x-generator", "x-powered-cms"):
+        if val := headers.get(hdr):
+            # Name = leading words; version = a later space-separated X.Y token.
+            if gm := re.match(r"([A-Za-z][\w.!-]*(?: [A-Za-z][\w.!-]*)*?)(?: +v?(\d[\d.]*))?(?:[ /(]|$)", val.strip()):
+                return gm.group(1).strip(), gm.group(2) or None, f"header {hdr}"
+    return None, None, None
+
+
+def detect_cms_active(url: str, client: HttpClient,
+                      signatures: list[CmsSignature]) -> tuple[str | None, str | None, str | None]:
+    """Probe well-known CMS marker paths (non-destructive GETs)."""
+    base = url.rstrip("/")
+    for sig in signatures:
+        for path in sig.active_paths:
+            try:
+                status, _, body = client.fetch(base + path, want_body=True)
+            except RuntimeError:
+                continue
+            if status == 200 and body:
+                version = None
+                if sig.version_pattern and (vm := re.search(sig.version_pattern, body, re.IGNORECASE)):
+                    version = vm.group(1)
+                return sig.name, version, f"active path {path}"
+    return None, None, None
+
+
+def parse_version(ver: str) -> tuple[int, int, int] | None:
+    parts = ver.split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    return int(parts[0]), int(parts[1]), int(parts[2])
+
+
+def assess(version: str | None) -> tuple[str, str, str]:
+    """Return (status, reason, recommendation) for a detected PHP version."""
+    if version is None:
+        return ("unknown", "PHP version could not be determined", "Fingerprint the host manually; assume exposed until confirmed.")
+
+    parsed = parse_version(version)
+    if parsed is None:
+        return ("unknown", f"Unrecognized version string: {version}", "Verify the PHP version manually.")
+
+    major, minor, _ = parsed
+    branch = (major, minor)
+
+    if major < 5 or (major == 5 and minor < 4):
+        return ("unknown", f"PHP {version} predates the stated affected range (5.4+)", "Confirm the real version; very old banners are often spoofed.")
+
+    if branch <= EOL_CEILING:
+        return ("vulnerable", f"PHP {version} is on an end-of-life branch with no official fix", f"Upgrade to a supported, patched branch. Interim: {MITIGATION}.")
+
+    fixed = FIXED_VERSIONS.get(branch)
+    if fixed is None:
+        if branch > max(FIXED_VERSIONS):
+            return ("unknown", f"PHP {version} is newer than tracked branches; likely patched", "Confirm against the latest PHP advisory.")
+        return ("unknown", f"No fixed-version data for branch {major}.{minor}", "Check the PHP advisory for this branch.")
+
+    if parsed >= fixed:
+        return ("patched", f"PHP {version} >= fixed {'.'.join(map(str, fixed))} for this branch", "No action for PHP2Shell; keep patching routine.")
+
+    return ("vulnerable", f"PHP {version} < fixed {'.'.join(map(str, fixed))} for this branch", f"Upgrade to {'.'.join(map(str, fixed))} or later on branch {major}.{minor}.")
+
+
+def _candidate_urls(url: str, scheme: str) -> list[str]:
+    if "://" in url:
+        return [url]
+    if scheme == "http":
+        return ["http://" + url]
+    if scheme == "both":
+        return ["https://" + url, "http://" + url]
+    return ["https://" + url]
+
+
+def check_url(url: str, client: HttpClient, active: bool, scheme: str,
+              signatures: list[CmsSignature]) -> Result:
+    res = Result(url=url, checked_at=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+
+    status = headers = body = None
+    last_exc = ""
+    for candidate in _candidate_urls(url, scheme):
         try:
-            r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-        except requests.RequestException:
-            continue
-        if needle and re.search(needle, r.text or ""):
-            hits.append((path, r.status_code))
-    return hits
-
-
-def probe_pearcmd(base_url, session):
-    """Check for the PEAR `pearcmd.php` + `register_argc_argv` sink that is a
-    well-known LFI->RCE escalation vector (cf. HackTricks / Patchstack
-    WordPress 7.1.2 CVE-2026-87902 research). Read-only presence check only:
-    this reports whether the file exists and whether argc/argv appear enabled,
-    WITHOUT executing anything."""
-    findings = []
-    # 1. Does pearcmd.php exist and expose its command surface?
-    for path in ("/pearcmd.php", "/pear/pearcmd.php", "/usr/share/php/pearcmd.php"):
-        url = urljoin(base_url + "/", path.lstrip("/"))
-        try:
-            r = session.get(url, timeout=TIMEOUT, allow_redirects=True)
-        except requests.RequestException:
-            continue
-        if r.status_code == 200 and re.search(r"pear|command", r.text or "", re.I):
-            findings.append((path, "pearcmd present (argc/argv sink candidate)"))
+            status, headers, body = client.fetch(candidate, want_body=True)
+            res.final_url = candidate
             break
+        except RuntimeError as exc:
+            last_exc = str(exc)
+    if headers is None:
+        res.status, res.reason = "error", f"request failed: {last_exc}"
+        return res
 
-    # 2. Probe register_argc_argv via a benign argv reflection: request the
-    #    homepage with a harmless query arg and see if it is reflected in a
-    #    way consistent with register_argc_argv=On. (Observational only.)
+    res.server = headers.get("server")
+    res.php_detected = php_is_present(headers, body)
+
+    # PHP version (passive)
+    version = extract_php_version(headers)
+    if version:
+        res.version_source = "response headers"
+
+    # CMS (passive)
+    res.cms, res.cms_version, res.cms_source = detect_cms(headers, body, signatures)
+
+    if active:
+        if version is None:
+            # Version-disclosure egg: non-destructive, returns a credits page.
+            try:
+                _, egg_headers, _ = client.fetch(res.final_url.rstrip("/") + "/" + PHP_EGG_QUERY, want_body=False)
+                if egg_version := extract_php_version(egg_headers):
+                    version, res.version_source = egg_version, "version-disclosure egg (active)"
+                    res.php_detected = True
+            except RuntimeError as exc:
+                log.info("egg probe failed for %s: %s", res.final_url, exc)
+        if res.cms is None:
+            res.cms, res.cms_version, res.cms_source = detect_cms_active(res.final_url, client, signatures)
+
+    # Evidence trail
+    bits = []
+    if res.server:
+        bits.append(f"Server: {res.server}")
+    if xp := headers.get("x-powered-by"):
+        bits.append(f"X-Powered-By: {xp}")
+    if res.version_source:
+        bits.append(f"version via {res.version_source}")
+    res.evidence = " | ".join(bits)
+
+    res.php_version = version
+    res.status, res.reason, res.recommendation = assess(version)
+
+    # Refine the "unknown" message when PHP is clearly present but hidden.
+    if version is None and res.php_detected:
+        res.reason = "PHP detected but version hidden (expose_php off / stripped banner)"
+        res.recommendation = "Confirm version out-of-band; treat as potentially exposed."
+    return res
+
+
+# --- Threat intel ------------------------------------------------------------
+def fetch_intel(client: HttpClient, cache_ttl_hours: float = 6.0) -> Intel:
+    """Correlate the two CVEs with CISA KEV presence and FIRST EPSS scores."""
+    intel = Intel()
+    notes = []
+
+    # CISA KEV (cached), to see whether either CVE is known-exploited yet.
+    cache = CACHE_DIR / "kev.json"
+    kev_data = None
     try:
-        probe = base_url + "/?php2shell_argv_probe=1"
-        r = session.get(probe, timeout=TIMEOUT, allow_redirects=True)
-        body = r.text or ""
-        # Heuristic: some apps/phpinfo echo argv; this is a weak signal only.
-        if re.search(r"php2shell_argv_probe|argv", body, re.I):
-            findings.append(("/?argv probe", "argv reflection observed (register_argc_argv may be On)"))
-    except requests.RequestException:
-        pass
-
-    return findings
-
-
-# ---------------------------------------------------------------------------
-# Main flow
-# ---------------------------------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser(
-        description="PHP2Shell research tool: CMS/PHP detection + "
-                    "session.upload_progress poisoning verification (CVE-2026-109618/109619).")
-    parser.add_argument("--url", "-u", help="Target URL (e.g. https://example.com)")
-    parser.add_argument("--probe-path", default="/index.php",
-                        help="Path to send the upload-progress probe to (default: /index.php)")
-    parser.add_argument("--sink-scan", action="store_true",
-                        help="Also probe for candidate include()/LFI sinks")
-    parser.add_argument("--mode", choices=MODES, default="passive",
-                        help="passive = single inert probe (default); "
-                             "active = filter-evasion + race probe (still no code execution)")
-    parser.add_argument("--no-confirm", action="store_true",
-                        help="Skip confirmation prompt before sending the probe")
-    args = parser.parse_args()
-
-    banner()
-
-    target = prompt_url(args.url)
-    if not target:
-        print(C.dim("[*] Exiting."))
-        sys.exit(0)
-
-    session = make_session()
-    base_url = target.rstrip("/")
-
-    # 1. Detect CMS
-    print(C.blue("\n[*] Detecting CMS..."))
-    cms = detect_cms(base_url, session)
-    print(C.green(f"[+] CMS          : {cms['name']}"))
-    print(C.green(f"[+] Confidence   : {cms['confidence']}"))
-    for ev in cms["evidence"]:
-        print(C.dim(f"      - {ev}"))
-
-    # 1b. Deeper behavior/version probes for the winning CMS
-    behaviors = detect_cms_behavior(base_url, session, cms["name"])
-    if behaviors:
-        print(C.cyan(f"[*] CMS behavior / version probes:"))
-        for path, val in behaviors:
-            print(C.green(f"[+]   {path} -> {val}"))
-
-    # 2. Detect PHP
-    print(C.blue("\n[*] Detecting PHP version / type..."))
-    php = detect_php(base_url, session)
-    if php["version"]:
-        print(C.green(f"[+] PHP version  : {php['version']}"))
-    else:
-        print(C.yellow("[+] PHP version  : not detected (expose_php may be Off)"))
-    if php["type"]:
-        print(C.green(f"[+] PHP type     : {php['type']}"))
-    if php["support"]:
-        s = php["support"]
-        color = C.red if s["status"] == "eol" else (C.yellow if s["status"] == "security" else C.green)
-        print(color(f"[+] Support      : {s['status']} ({s['note']})"))
-    for ev in php["evidence"]:
-        print(C.dim(f"      - {ev}"))
-
-    # 2b. Defensive config exposure (observational, no memory corruption)
-    print(C.blue("\n[*] Assessing config exposure (defensive, read-only)..."))
-    cfg = detect_config_exposure(base_url, session)
-    def _kv(k, v):
-        return C.dim(f"      - {k}: {v}") if v is not None else C.dim(f"      - {k}: not observable")
-    print(_kv("upload_progress", cfg["upload_progress"]))
-    print(_kv("cleanup", cfg["cleanup"]))
-    print(_kv("memory_limit", cfg["memory_limit"]))
-    print(_kv("post_max_size", cfg["post_max_size"]))
-    print(_kv("SAPI", cfg["sapi"]))
-    for n in cfg["notes"]:
-        print(C.dim(f"        · {n}"))
-
-    # 3. Confirm before sending the poisoning primitive
-    if not args.no_confirm:
-        print()
-        if args.mode == "active":
-            print(C.yellow("[!] mode=active: will send concurrent + large-body probes "
-                           "(race against session cleanup). Still NO code execution."))
-        ans = input(C.yellow(
-            f"[?] Send upload-progress probe (mode={args.mode})? [y/N]: ")).strip().lower()
-        if ans not in ("y", "yes"):
-            print(C.dim("[*] Cancelled by user."))
-            sys.exit(0)
-
-    # 4. Probe the primitive
-    mode = args.mode
-    print(C.blue(f"\n[*] Sending session.upload_progress probe (mode={mode})..."))
-    obs = probe_upload_progress(base_url, session, args.probe_path, mode=mode)
-    print(C.yellow(f"[i] Mode         : {obs['mode']}"))
-    print(C.yellow(f"[i] Session id   : {obs['sid']}"))
-    print(C.yellow(f"[i] Inert canary : {obs['canary']!r}"))
-    for n in obs["notes"]:
-        print(C.dim(f"      - {n}"))
-
-    if obs["php_session_set"]:
-        via = f" (via {obs['p1_via']})" if obs.get("p1_via") else ""
-        print(C.green("[+] P1 CONFIRMED: PHP accepted the cookie-less session id"
-                      f"{via}."))
-    elif obs["status"] is not None:
-        print(C.yellow("[~] P1 status: session id sent, but no session cookie in response "
-                       "(app may use a custom session name, or upload_progress disabled)."))
-    else:
-        print(C.red("[-] Request failed — target unreachable or filtering the request."))
-
-    if obs.get("progress_marker_seen"):
-        print(C.green("[+] P2 CORROBORATED: target confirms the upload-progress marker reached PHP."))
-
-    # 4b. Coarse exposure verdict
-    verdict = assess_vulnerability(obs, php)
-    vc = C.red if verdict["color"] == "red" else (C.yellow if verdict["color"] == "yellow" else C.green)
-    print()
-    print(vc(C.bold(f"[=>] VERDICT: {verdict['label']}")))
-    for r in verdict["reasons"]:
-        print(C.dim(f"      - {r}"))
-
-    print(C.yellow(
-        "\n[i] IMPORTANT: the above verifies the session.upload_progress "
-        "content-injection primitive ONLY."))
-    print(C.yellow(
-        "[i] It does NOT mean code execution. RCE requires an app-side "
-        "include()/require() of the poisoned session file (an LFI/include sink)."))
-    print(C.yellow(
-        "[i] Official affected/fixed versions are still unpublished; this verdict "
-        "is an estimate based on observable primitive + PHP branch support."))
-
-    # 5. Optional sink scan
-    if args.sink_scan:
-        print(C.blue("\n[*] Probing candidate include()/LFI sinks..."))
-        sinks = probe_include_sinks(base_url, session, cms_name=cms["name"])
-        if sinks:
-            for path, code in sinks:
-                print(C.green(f"[+] Potential sink: {path} -> {code}"))
+        if cache.exists() and time.time() - cache.stat().st_mtime < cache_ttl_hours * 3600:
+            kev_data = json.loads(cache.read_text())
         else:
-            print(C.dim("[-] No obvious include/LFI sink found in the candidate list."))
+            kev_data = client.get_json(KEV_URL)
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(kev_data))
+    except (RuntimeError, json.JSONDecodeError, OSError) as exc:
+        notes.append(f"KEV unavailable ({exc})")
+        if cache.exists():
+            try:
+                kev_data = json.loads(cache.read_text())
+                notes.append("using stale KEV cache")
+            except (json.JSONDecodeError, OSError):
+                kev_data = None
 
-        print(C.blue("[*] Probing PEAR pearcmd.php / register_argc_argv sink..."))
-        pear = probe_pearcmd(base_url, session)
-        if pear:
-            for path, note in pear:
-                print(C.green(f"[+] {path}: {note}"))
-        else:
-            print(C.dim("[-] pearcmd.php not found / argv not reflected."))
+    if kev_data:
+        hits = [v for v in kev_data.get("vulnerabilities", []) if v.get("cveID") in CVES]
+        intel.in_kev = bool(hits)
+        if hits:
+            intel.kev_date_added = min(h.get("dateAdded", "") for h in hits)
+        notes.append("KEV: listed" if hits else "KEV: not yet listed")
 
-    print()
+    # FIRST EPSS exploitation-probability scores.
+    try:
+        rows = client.get_json(f"{EPSS_URL}?{urllib.parse.urlencode({'cve': ','.join(CVES)})}").get("data", [])
+        intel.epss = {r["cve"]: float(r["epss"]) for r in rows}
+        if intel.epss:
+            notes.append("EPSS: " + ", ".join(f"{c}={s:.3f}" for c, s in intel.epss.items()))
+    except (RuntimeError, json.JSONDecodeError, KeyError, ValueError) as exc:
+        notes.append(f"EPSS unavailable ({exc})")
+
+    intel.note = " | ".join(notes) if notes else "no intel returned"
+    return intel
+
+
+def intel_banner(intel: Intel) -> str:
+    kev_raw = {True: "YES", False: "no", None: "?"}[intel.in_kev]
+    kev = c(kev_raw, "red", "bold") if intel.in_kev else c(kev_raw, "green") if intel.in_kev is False else kev_raw
+    epss = ", ".join(f"{cve.split('-')[-1]}={s:.3f}" for cve, s in intel.epss.items()) or "n/a"
+    added = f" (added {intel.kev_date_added})" if intel.kev_date_added else ""
+    return c("Intel", "bold") + f" — CISA KEV: {kev}{added} | EPSS: {epss}"
+
+
+# --- Targets & output --------------------------------------------------------
+def load_targets(args: argparse.Namespace) -> list[str]:
+    targets = list(args.urls)
+    if args.input:
+        text = sys.stdin.read() if str(args.input) == "-" else args.input.read_text()
+        targets += [line.strip() for line in text.splitlines() if line.strip() and not line.startswith("#")]
+    seen, ordered = set(), []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            ordered.append(t)
+    return ordered
+
+
+def load_signatures(path: pathlib.Path) -> list[CmsSignature]:
+    """Load CMS signatures from an external JSON file (list of objects)."""
+    data = json.loads(path.read_text())
+    sigs = []
+    for item in data:
+        sigs.append(CmsSignature(
+            name=item["name"],
+            html_patterns=list(item.get("html_patterns", [])),
+            active_paths=list(item.get("active_paths", [])),
+            version_pattern=item.get("version_pattern"),
+        ))
+    if not sigs:
+        raise ValueError("signature file contained no entries")
+    return sigs
+
+
+def _cms_label(r: Result) -> str:
+    if not r.cms:
+        return "-"
+    return f"{r.cms} {r.cms_version}" if r.cms_version else r.cms
+
+
+def render_table(results: list[Result], intel: Intel | None) -> str:
+    icon = {"vulnerable": "[VULN]", "patched": "[ ok ]", "unknown": "[ ?? ]", "error": "[err ]"}
+    # Plain rows drive column widths (color codes must not count toward width).
+    plain = [
+        [icon.get(r.status, "[ ?? ]"), r.status.upper(), r.php_version or "-", _cms_label(r), r.url, r.reason]
+        for r in results
+    ]
+    headers = ["", "STATUS", "PHP", "CMS", "URL", "REASON"]
+    widths = [max(len(h), *(len(row[i]) for row in plain)) if plain else len(h) for i, h in enumerate(headers)]
+
+    def fmt(cells: list[str], styles: list[tuple[str, ...]] | None = None) -> str:
+        out = []
+        for i, (val, w) in enumerate(zip(cells, widths)):
+            cell = str(val).ljust(w)
+            if styles and styles[i]:
+                cell = c(cell, *styles[i])
+            out.append(cell)
+        return "  ".join(out)
+
+    lines = [c(fmt(headers), "bold"), fmt(["-" * w for w in widths])]
+    for r, row in zip(results, plain):
+        st = STATUS_STYLE.get(r.status, ())
+        styles = [st, st, (), (), ("cyan",), ()]
+        lines.append(fmt(row, styles))
+
+    out = []
+    if intel:
+        out += [intel_banner(intel), ""]
+    out += lines
+    return "\n".join(out)
+
+
+def render_json(results: list[Result], intel: Intel | None) -> str:
+    doc: dict = {"results": [asdict(r) for r in results]}
+    if intel:
+        doc["intel"] = asdict(intel)
+    return json.dumps(doc, indent=2)
+
+
+def render_csv(results: list[Result]) -> str:
+    buf = io.StringIO()
+    fields = list(asdict(results[0]).keys()) if results else [f.name for f in Result.__dataclass_fields__.values()]
+    writer = csv.DictWriter(buf, fieldnames=fields)
+    writer.writeheader()
+    for r in results:
+        row = asdict(r)
+        row["cves"] = ",".join(row["cves"])
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+def render_markdown(results: list[Result], intel: Intel | None) -> str:
+    today = datetime.now(timezone.utc).date().isoformat()
+    lines = [
+        "---",
+        f"title: PHP2Shell Exposure Scan {today}",
+        f"date: {today}",
+        "tags: [threat-intel, cve, php, php2shell]",
+        f"cves: [{', '.join(CVES)}]",
+    ]
+    if intel:
+        lines.append(f"kev_listed: {intel.in_kev}")
+        if intel.epss:
+            lines.append(f"epss: {{{', '.join(f'{c}: {s}' for c, s in intel.epss.items())}}}")
+    lines += [
+        "---",
+        "",
+        f"# PHP2Shell Exposure Scan — {today}",
+        "",
+        f"Checking {', '.join(CVES)} (CVSS 9.2). Fixed: 8.5.12 / 8.4.27 / 8.3.36 / 8.2.35.",
+    ]
+    if intel:
+        lines += ["", f"> {intel_banner(intel)}"]
+    lines += [
+        "",
+        "| Status | PHP | CMS | URL | Reason | Recommendation |",
+        "|---|---|---|---|---|---|",
+    ]
+    for r in results:
+        lines.append(f"| {r.status} | {r.php_version or '-'} | {_cms_label(r)} | {r.url} | {r.reason} | {r.recommendation} |")
+    return "\n".join(lines) + "\n"
+
+
+def summary(results: list[Result]) -> str:
+    counts = {s: sum(r.status == s for r in results) for s in ("vulnerable", "patched", "unknown", "error")}
+    return (f"{len(results)} target(s) | vulnerable: {counts['vulnerable']} | "
+            f"patched: {counts['patched']} | unknown: {counts['unknown']} | error: {counts['error']}")
+
+
+# fail-on severity: each level triggers a nonzero exit for its status + worse.
+FAIL_LEVELS = {
+    "never": set(),
+    "vulnerable": {"vulnerable"},
+    "unknown": {"vulnerable", "unknown"},
+    "error": {"vulnerable", "unknown", "error"},
+}
+
+
+def should_fail(results: list[Result], fail_on: str) -> bool:
+    trigger = FAIL_LEVELS[fail_on]
+    return any(r.status in trigger for r in results)
+
+
+def parse_headers(pairs: list[str]) -> dict[str, str]:
+    headers = {}
+    for item in pairs:
+        if ":" not in item:
+            raise argparse.ArgumentTypeError(f"bad header (want 'Name: value'): {item!r}")
+        name, _, value = item.partition(":")
+        headers[name.strip()] = value.strip()
+    return headers
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="PHP2Shell exposure checker (CVE-2026-109618/109619).")
+    p.add_argument("urls", nargs="*", help="target URLs")
+    p.add_argument("-i", "--input", type=lambda s: s if s == "-" else pathlib.Path(s),
+                   help="file with one URL per line ('-' for stdin)")
+    p.add_argument("--no-safe-mode", dest="active", action="store_true",
+                   help="active recon: version-disclosure egg + CMS marker paths (non-destructive)")
+    p.add_argument("--workers", type=int, default=10, help="concurrent workers (default 10)")
+    p.add_argument("--scheme", choices=["https", "http", "both"], default="https",
+                   help="scheme to assume for bare hosts (default https)")
+    p.add_argument("--timeout", type=float, default=15.0, help="per-request timeout (default 15s)")
+    p.add_argument("--retries", type=int, default=2, help="transport-error retries (default 2)")
+    p.add_argument("--insecure", action="store_true", help="skip TLS certificate verification")
+    p.add_argument("--proxy", help="proxy URL, e.g. http://127.0.0.1:8080 (Burp/mitmproxy)")
+    p.add_argument("-H", "--header", action="append", default=[], metavar="NAME: VALUE",
+                   help="extra request header (repeatable)")
+    p.add_argument("--user-agent", default=USER_AGENT, help="override the User-Agent")
+    p.add_argument("--signatures", type=pathlib.Path, help="external CMS signature JSON to use instead of built-ins")
+    p.add_argument("--no-intel", action="store_true", help="skip live CISA KEV / EPSS correlation")
+    p.add_argument("--fail-on", choices=list(FAIL_LEVELS), default="vulnerable",
+                   help="exit nonzero when a result at this severity or worse is found (default vulnerable)")
+    p.add_argument("--format", choices=["table", "json", "csv", "md"], default="table")
+    p.add_argument("--out", type=pathlib.Path, help="write output to a file")
+    p.add_argument("--log", type=pathlib.Path, help="also write timestamped logs to this file")
+    p.add_argument("--no-color", action="store_true", help="disable ANSI colors")
+    p.add_argument("--no-banner", action="store_true", help="suppress the startup banner")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    import os
+    global _USE_COLOR
+    _USE_COLOR = (not args.no_color and os.environ.get("NO_COLOR") is None and sys.stderr.isatty())
+
+    if not args.no_banner:
+        print(c(BANNER, "cyan"), file=sys.stderr)
+
+    level = logging.INFO if args.verbose else logging.WARNING
+    handlers: list[logging.Handler] = [logging.StreamHandler(sys.stderr)]
+    if args.log:
+        handlers.append(logging.FileHandler(args.log))
+    logging.basicConfig(level=level, handlers=handlers,
+                        format="%(asctime)s %(levelname)s %(message)s", datefmt="%Y-%m-%dT%H:%M:%S")
+
+    try:
+        extra_headers = parse_headers(args.header)
+    except argparse.ArgumentTypeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    signatures = CMS_SIGNATURES
+    if args.signatures:
+        try:
+            signatures = load_signatures(args.signatures)
+            log.info("Loaded %d external CMS signatures from %s", len(signatures), args.signatures)
+        except (OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            print(f"error: could not load signatures: {exc}", file=sys.stderr)
+            return 2
+
+    targets = load_targets(args)
+    if not targets:
+        print("error: no targets given (pass URLs or -i FILE)", file=sys.stderr)
+        return 2
+
+    client = HttpClient(timeout=args.timeout, insecure=args.insecure, retries=max(0, args.retries),
+                        proxy=args.proxy, extra_headers=extra_headers, user_agent=args.user_agent)
+
+    mode = "ACTIVE (no-safe-mode)" if args.active else "SAFE (passive)"
+    log.info("Mode: %s | targets: %d | workers: %d | scheme: %s", mode, len(targets), args.workers, args.scheme)
+
+    intel = None
+    if not args.no_intel:
+        intel = fetch_intel(client)
+        log.info(intel.note)
+
+    def work(u: str) -> Result:
+        return check_url(u, client, args.active, args.scheme, signatures)
+
+    total = len(targets)
+    show_progress = sys.stderr.isatty() and args.format == "table"
+
+    def progress(done: int, r: Result) -> None:
+        if not show_progress:
+            return
+        st = STATUS_STYLE.get(r.status, ())
+        tag = c(r.status.upper(), *st) if st else r.status.upper()
+        sys.stderr.write(f"\r\033[K[{done}/{total}] {tag}  {r.url}")
+        sys.stderr.flush()
+        if done == total:
+            sys.stderr.write("\n")
+
+    workers = max(1, min(args.workers, total))
+    results: list[Result] = [None] * total  # type: ignore[list-item]
+    if workers == 1:
+        for idx, u in enumerate(targets):
+            results[idx] = r = work(u)
+            progress(idx + 1, r)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(work, u): idx for idx, u in enumerate(targets)}
+            done = 0
+            for fut in as_completed(futures):
+                idx = futures[fut]
+                results[idx] = r = fut.result()
+                done += 1
+                progress(done, r)
+
+    match args.format:
+        case "json":
+            output = render_json(results, intel)
+        case "csv":
+            output = render_csv(results)
+        case "md":
+            output = render_markdown(results, intel)
+        case _:
+            output = render_table(results, intel)
+
+    if args.out:
+        args.out.write_text(output if output.endswith("\n") else output + "\n")
+        print(f"Wrote report for {len(results)} target(s) to {args.out}", file=sys.stderr)
+    else:
+        print(output)
+
+    print(summary(results), file=sys.stderr)
+    return 1 if should_fail(results, args.fail_on) else 0
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print(C.dim("\n[*] Interrupted."))
-        sys.exit(130)
+    sys.exit(main())
