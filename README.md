@@ -2,11 +2,13 @@
 
 > Research & assessment tool for **CVE-2026-109618** and **CVE-2026-109619** ("PHP2Shell").
 
-A single-file Python tool that fingerprints a target, verifies the confirmed
-`session.upload_progress` **session-file poisoning** primitive, and produces a
-coarse exposure verdict — **without** shipping a weaponized RCE exploit.
+A single-file, **stdlib-only** Python tool that fingerprints a target's **PHP
+version** and **CMS/platform**, correlates the two CVEs with **live threat
+intel** (CISA KEV + FIRST EPSS), and produces a coarse exposure verdict —
+**without** shipping, or even attempting, any code-execution payload.
 
-[![Python](https://img.shields.io/badge/Python-3.8%2B-blue.svg)](https://www.python.org/)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
+[![Dependencies](https://img.shields.io/badge/deps-stdlib%20only-success.svg)](#requirements)
 [![License](https://img.shields.io/badge/License-Proprietary-red.svg)](#disclaimer)
 [![Status](https://img.shields.io/badge/Status-Research-orange.svg)](#disclaimer)
 
@@ -17,152 +19,204 @@ coarse exposure verdict — **without** shipping a weaponized RCE exploit.
 This tool is provided for **authorized security research and assessment only**.
 
 - Run it **only** against systems you own or have **explicit written authorization** to test.
-- It **verifies an observable primitive and assesses exposure** — it does **not**
-  perform code execution against any target.
+- It **fingerprints and assesses exposure** — it does **not** perform code
+  execution, send exploit payloads, poison sessions, or write files on any target.
 - The author assumes **no liability** for misuse or unauthorized testing.
-
-> **Not for public release** — this repository is a private/internal research
-> artifact shared for review purposes.
 
 ---
 
-## What this is (and isn't)
+## Why this is detection-only
+
+Both CVEs are **internal PHP memory-safety bugs**:
+
+| CVE | Class | Advisory |
+|-----|-------|----------|
+| **CVE-2026-109618** | Out-of-memory handling corrupts partially-initialized request data | GHSA-w8hw-w9fx-j79w |
+| **CVE-2026-109619** | Use-after-free: request state outlives freed memory, reused by a later request on the same worker | GHSA-6wmf-4rv5-p3rp |
+
+Both are rated **CVSS v4.0 9.2 (critical)**. There is **no safe, reliable
+boolean "trigger"** for them: a genuine attempt to drive the UAF/OOM condition
+tends to crash the worker and amounts to weaponization. So this tool determines
+exposure the responsible way — by **fingerprinting the reported PHP version and
+configuration** and comparing against the vendor's fixed releases.
+
+### Affected / fixed versions
+
+- **Vulnerable:** PHP **5.4 through 8.5.11**
+- **Fixed builds:** **8.5.12 · 8.4.27 · 8.3.36 · 8.2.35**
+- **EOL branches (≤ 8.1):** vulnerable, **no official fix** — upgrade to a
+  supported branch; interim mitigation: `session.upload_progress.enabled=0` +
+  restart all PHP workers (not a complete fix).
+
+---
+
+## What it is (and isn't)
 
 ### It IS
 
-- ✅ A **CMS fingerprinting** tool (11 CMS + generic PHP fallback)
-- ✅ A **PHP version / type / support-status** detector
-- ✅ A **verifier** of the confirmed `session.upload_progress` poisoning primitive
-  (P1 + P2), using an **inert canary** (a PHP comment — never a shell)
-- ✅ An **exposure assessor** that combines primitive observation with PHP
-  branch support status
+- ✅ A **PHP version detector** (from `Server` / `X-Powered-By`, and — in active
+  mode — PHP's version-disclosure "egg"), with a heuristic "PHP present but
+  version hidden" signal.
+- ✅ A **CMS/platform fingerprinter** (10 built-ins + overridable via JSON).
+- ✅ A **version-based exposure assessor** (`vulnerable` / `patched` / `unknown`).
+- ✅ A **threat-intel correlator** — live CISA KEV presence + FIRST EPSS scores.
+- ✅ A **scanner**: concurrent, proxy-aware, multiple output formats.
 
 ### It is NOT
 
-- ❌ A weaponized RCE exploit
-- ❌ A PHP object-deserialization gadget chain
-- ❌ A guarantee of code execution
-
----
-
-## Background
-
-PHP2Shell refers to the developing disclosure around two PHP-core remote code
-execution bugs. As of the advisory window (Oct 2026), the **only technically
-documented primitive** is **session-file poisoning** via the
-`session.upload_progress` feature:
-
-| Primitive | Description |
-|-----------|-------------|
-| **P1** | Set a session ID *cookie-lessly* via a `PHPSESSID` field in the multipart body. |
-| **P2** | Inject arbitrary content (e.g. `<?php ...`) into the session file via the `PHP_SESSION_UPLOAD_PROGRESS` field value and the uploaded filename, which PHP serializes verbatim into `sess_<id>`. |
-
-Injected content only becomes **code execution** when the target application
-performs an `include()` / `require()` on the poisoned session file. Stock
-WordPress / Joomla / Drupal do **not** hand you that sink.
-
-> **Important:** the official affected/fixed versions were **still unpublished**
-> at the time of writing (NVD returns 0 results for both CVEs). No verified
-> public PoC for the RCE exists — only the poisoning primitive is public.
-
-For deeper background, see [`docs/RESEARCH.md`](docs/RESEARCH.md).
-
----
-
-## Features
-
-- 🎯 **Interactive + CLI** target input (`--url`, or prompt)
-- 🧭 **11 CMS fingerprints** — WordPress, Joomla, Drupal, Magento, Laravel,
-  CodeIgniter, Symfony, phpBB, PrestaShop, OpenCart, Typo3 (+ generic PHP)
-- 🧬 **Per-CMS behavior/version probes** — reads version-leaking static files
-  (`readme.html`, `wp-includes/version.php`, `CHANGELOG.txt`, …) for the winning CMS
-- 🐘 **PHP version / type / support-status** detection (active / security / EOL)
-- 🧪 **Inert** poisoning-primitive probe (P1 + P2, canary = PHP comment)
-- 🛡️ **Two observation modes** — `passive` (single inert probe, default) and
-  `active` (filter-evasion + race against `session.upload_progress.cleanup`).
-  **Neither performs code execution** — both are purely observational.
-- 📊 **Coarse exposure verdict** (Likely affected → Unreachable)
-- 🧱 **Defensive config exposure** — reads observable `session.upload_progress.enabled`,
-  `cleanup`, `memory_limit`/`post_max_size`, and SAPI hints (prefork vs FPM/LSAPI)
-  to assess *feasibility* of the memory-bug class — read-only, no corruption
-- 🔗 **Per-CMS** candidate `include()`/LFI sink scan (`--sink-scan`)
-- 🍐 **PEAR sink probe** — checks `pearcmd.php` presence + `register_argc_argv`
-  reflection (a known LFI→RCE escalation vector) — read-only
+- ❌ A weaponized RCE exploit or PoC.
+- ❌ A session-poisoning / `session.upload_progress` primitive prober.
+- ❌ A deserialization gadget chain, LFI sink scanner, or file writer.
+- ❌ A guarantee of exploitability — a version match is *exposure*, not proof.
 
 ---
 
 ## Requirements
 
-- Python **3.8+**
-- [`requests`](https://pypi.org/project/requests/)
-
-```bash
-pip install requests
-```
+- Python **3.10+** (uses structural `match` and `X | None` typing)
+- **No third-party dependencies** — standard library only.
 
 ---
 
 ## Usage
 
 ```bash
-python3 php2shell.py --url https://example.com
+python3 script_test.py https://target.example
 ```
 
-### Full options
+The tool prints a banner + colored table to the terminal, and a one-line
+threat-intel summary. Colors, banner, and the live progress indicator are
+automatically disabled when output is piped or when `--format json|csv`.
+
+### Options
 
 ```
-usage: php2shell.py [-h] [--url URL] [--probe-path PROBE_PATH]
-                    [--sink-scan] [--mode {passive,active}] [--no-confirm]
+positional arguments:
+  urls                        target URLs
 
 options:
-  -h, --help            show this help message and exit
-  --url, -u URL         Target URL (e.g. https://example.com)
-  --probe-path PATH     Path for the upload-progress probe (default: /index.php)
-  --sink-scan           Also probe for candidate include()/LFI sinks
-  --mode {passive,active}
-                        passive = single inert probe (default);
-                        active = filter-evasion + race probe (still no code execution)
-  --no-confirm          Skip confirmation prompt before sending the probe
+  -h, --help                  show this help message and exit
+  -i, --input FILE            file with one URL per line ('-' for stdin)
+  --no-safe-mode              active recon: version-disclosure egg + CMS marker
+                              paths (non-destructive)
+  --workers N                 concurrent workers (default 10)
+  --scheme {https,http,both}  scheme to assume for bare hosts (default https)
+  --timeout SECONDS           per-request timeout (default 15)
+  --retries N                 transport-error retries (default 2)
+  --insecure                  skip TLS certificate verification
+  --proxy URL                 proxy URL, e.g. http://127.0.0.1:8080 (Burp/mitmproxy)
+  -H, --header "NAME: VALUE"  extra request header (repeatable)
+  --user-agent UA             override the User-Agent
+  --signatures FILE           external CMS signature JSON instead of built-ins
+  --no-intel                  skip live CISA KEV / EPSS correlation
+  --fail-on {never,vulnerable,unknown,error}
+                              exit nonzero at this severity or worse (default vulnerable)
+  --format {table,json,csv,md}
+  --out FILE                  write output to a file
+  --log FILE                  also write timestamped logs to this file
+  --no-color                  disable ANSI colors
+  --no-banner                 suppress the startup banner
+  -v, --verbose
 ```
 
-### Observation modes
+### Scan modes
 
-> **Neither mode performs code execution.** This tool has no RCE payload, no
-> shell upload, no file write, and no gadget chain. Both modes only *observe*
-> whether the `session.upload_progress` poisoning primitive lands.
+> **Neither mode performs code execution or sends an exploit payload.** The
+> difference is only how the PHP version and CMS are discovered.
 
-| Mode | Default | Behaviour |
-|------|---------|-----------|
-| `passive` | ✅ | One inert multipart probe. Canary is a plain PHP comment. Minimal footprint. |
-| `active` | | **Still observational, still non-destructive.** Whitespace-padded canary (defeats naive `<?php` prefix filters) + concurrent/large-body requests to race `session.upload_progress.cleanup`. *"active" = actively probing, NOT actively exploiting.* |
+| Mode | Flag | Behaviour |
+|------|------|-----------|
+| **safe** (default) | *(none)* | **Passive.** Reads the PHP version and CMS only from response headers and the landing-page HTML. One request per target (plus scheme fallback). |
+| **active** | `--no-safe-mode` | Adds **non-destructive recon**: PHP's version-disclosure "egg" query (recovers the version even when `expose_php` is off) and a few well-known CMS marker paths (e.g. `/readme.html`, `/CHANGELOG.txt`). Still read-only. |
 
-> **Race note (from research):** PHP defaults `session.upload_progress.cleanup`
-> to `On`, so the progress entry is deleted as soon as the upload completes.
-> `active` tries to widen that window — but actual RCE additionally requires an
-> app-side `include()`/`require()` of the session file (an LFI sink).
+### Exposure verdicts
+
+| Status | Meaning |
+|--------|---------|
+| `vulnerable` | Detected PHP version is below the fixed build for its branch, or on an EOL branch. |
+| `patched` | Detected version ≥ the fixed build for its branch. |
+| `unknown` | Version could not be determined (often PHP present but banner hidden), or outside the tracked range. |
+| `error` | Target unreachable (DNS/TLS/timeout after retries). |
+
+**Exit codes:** `0` clean · `1` a result met `--fail-on` severity (default
+`vulnerable`) · `2` usage error.
 
 ### Examples
 
 ```bash
-# Detection only (answer 'n' at the confirmation prompt)
-python3 php2shell.py --url https://example.com
+# Single target, table + live KEV/EPSS intel
+python3 script_test.py https://example.com
 
-# Full run including sink scan, no interactive prompt
-python3 php2shell.py -u https://example.com --sink-scan --no-confirm
+# Concurrent scan from a file, active recon
+python3 script_test.py --no-safe-mode --workers 20 -i urls.txt
 
-# Active (filter-evasion + race) observation — still no code execution
-python3 php2shell.py -u https://example.com --mode active --no-confirm
+# Through Burp, with a session cookie, machine-readable JSON
+python3 script_test.py https://example.com \
+    --proxy http://127.0.0.1:8080 -H "Cookie: SESS=..." --format json
 
-# Custom probe path (e.g. WordPress backend)
-python3 php2shell.py -u https://example.com --probe-path /wp-login.php
+# Obsidian-ready Markdown report (YAML frontmatter + tags)
+python3 script_test.py -i urls.txt --format md --out report.md
+
+# CSV for spreadsheets; try HTTP as well as HTTPS; fail CI on 'unknown' too
+python3 script_test.py -i urls.txt --format csv --scheme both --fail-on unknown
 ```
 
 ---
 
-## How it works
+## Output formats
 
-See the module docstring (top of `php2shell.py`) or [`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md)
-for a step-by-step breakdown of the 7-phase flow.
+- **table** — colored terminal table with an intel banner (default).
+- **json** — `{ "results": [...], "intel": {...} }`, one object per target with
+  full evidence (`evidence`, `final_url`, `checked_at`, `php_detected`, …).
+- **csv** — flat rows for spreadsheets / data pipelines.
+- **md** — Markdown with YAML frontmatter and `#threat-intel` tags, ready to drop
+  into an Obsidian vault.
+
+---
+
+## Threat intel correlation
+
+On each run (unless `--no-intel`) the tool fetches:
+
+- **CISA KEV** — whether CVE-2026-109618/109619 are in the Known Exploited
+  Vulnerabilities catalog yet (cached locally for 6h at `~/.cache/php2shell/`).
+- **FIRST EPSS** — current exploitation-probability scores for both CVEs.
+
+These appear as an `Intel —` banner (table/md) or an `intel` object (json).
+
+---
+
+## Custom CMS signatures
+
+Override the built-in fingerprints with `--signatures file.json`:
+
+```json
+[
+  {
+    "name": "CustomCMS",
+    "html_patterns": ["X-Custom-Thing", "powered by customcms ?(\\d[\\d.]*)"],
+    "active_paths": ["/custom/version.txt"],
+    "version_pattern": "customcms ?(\\d[\\d.]*)"
+  }
+]
+```
+
+Built-in CMS fingerprints (10): **WordPress, Joomla, Drupal, Magento, TYPO3,
+PrestaShop, Laravel, phpBB, MediaWiki, Plesk** — plus a generic "PHP present"
+heuristic (via `PHPSESSID` cookie, `X-Powered-By`, or `.php` references).
+
+---
+
+## Tests
+
+```bash
+python3 -m pytest -q          # 30 tests
+python3 test_script_test.py   # same, if pytest isn't installed
+```
+
+Tests never touch the network — the HTTP layer is monkeypatched. They cover the
+version-assessment boundaries, CMS detection, scheme fallback, `--fail-on`
+logic, header parsing, and the full `check_url` pipeline.
 
 ---
 
@@ -171,19 +225,16 @@ for a step-by-step breakdown of the 7-phase flow.
 ```
 .
 ├── README.md
-├── php2shell.py          # main tool (single file)
-├── docs/
-│   ├── RESEARCH.md       # research findings & source summary
-│   ├── HOW_IT_WORKS.md   # step-by-step technical breakdown
-│   └── SECURITY.md       # responsible-use / security notes
-└── LICENSE               # (optional) license terms
+├── CLAUDE.md             # guidance for AI coding agents
+├── script_test.py       # main tool (single file, stdlib only)
+└── test_script_test.py  # pytest suite (30 tests)
 ```
 
 ---
 
 ## Author
 
-- **sudo3rs (Mas Rian)**
+- **sudo3rs (Mas Riyan)**
 - GitHub: [github.com/masriyan/php2shell](https://github.com/masriyan/php2shell)
 - LinkedIn: [linkedin.com/in/sudo3rs](https://www.linkedin.com/in/sudo3rs/)
 
@@ -191,9 +242,11 @@ for a step-by-step breakdown of the 7-phase flow.
 
 ## References
 
-- [Sansec — Critical PHP RCE](https://sansec.io/research/php2shell)
-- [Huntress — PHP2Shell: Leaked critical PHP vulnerabilities](https://www.huntress.com/blog/php2shell-leaked-critical-php-vulnerabilities)
+- [Sansec — PHP2Shell: PHP RCE](https://sansec.io/research/php2shell)
+- [Rapid7 — Critical Unauthenticated RCE in PHP](https://www.rapid7.com/blog/post/etr-cve-2026-109618-and-cve-2026-109619-critical-unauthenticated-remote-code-execution-in-php/)
+- [Tenable — PHP2Shell FAQ](https://www.tenable.com/blog/php2shell-cve-2026-109618-cve-2026-109619-frequently-asked-questions-about-critical-php-remote)
 - [watchTowr — PHP RCE FAQ](https://watchtowr.com/intelligence/php-cve-2026-109618-faq/)
-- [PentestIT — What we know about php2shell](https://pentestit.com/php-cve-2026-109618-and-cve-2026-109619-what-we-know-about-php2shell/)
-- [syhunt/php2shell-protection](https://github.com/syhunt/php2shell-protection)
-- [mikensec/php2shell-lab](https://github.com/mikensec/php2shell-lab)
+- [Google Cloud — Responding to core PHP vulnerabilities](https://cloud.google.com/blog/products/identity-security/responding-to-core-php-vulnerabilities-cve-2026-109618-cve-2026-109619)
+- [SOCRadar — Affected Versions & Fix](https://socradar.io/blog/php2shell-cve-2026-109618-cve-2026-109619/)
+- [Help Net Security — PHP2Shell patched](https://www.helpnetsecurity.com/2026/10/21/php2shell-php-vulnerabilities-patched-cve-2026-109618-cve-2026-109619/)
+- [Plesk — PHP2Shell advisory](https://support.plesk.com/hc/en-us/articles/44397729587351)
